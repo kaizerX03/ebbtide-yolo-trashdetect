@@ -1,0 +1,16 @@
+# YOLO Detection Configuration
+
+model:
+  path: "/home/pi/yolo_env/ebb_ncnn_model"  # You can change this to your custom model path
+  confidence_threshold: 0.5
+
+camera:
+  source: "picamera0"  # Options: "usb0", "usb1", "picamera0" 
+  resolution: "640x480"  # Format: WIDTHxHEIGHT
+
+recording:
+  enabled: false  # Set to true to record video output
+
+distance_estimation:
+  focal_length_px: 998.4
+  known_object_height_mm: 100
