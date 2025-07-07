@@ -31,6 +31,11 @@ min_thresh = float(config['model']['confidence_threshold'])
 resW, resH = map(int, config['camera']['resolution'].split('x'))
 record = config['recording']['enabled']
 
+# Parse distance estimation parameters
+distance_estimation_config = config.get('distance_estimation', {})
+focal_length_px = distance_estimation_config.get('focal_length_px')
+known_object_height_mm = distance_estimation_config.get('known_object_height_mm')
+
 # Check if model file exists
 if not os.path.exists(model_path):
     print('ERROR: Model path is invalid or model was not found.')
@@ -55,28 +60,18 @@ elif 'picamera' in img_source:
     source_type = 'picamera'
     cap = Picamera2()
     
-    # Create a more optimized configuration for Pi Camera
+    # Create a simple configuration for Pi Camera
     config = cap.create_video_configuration(
-        main={"format": 'RGB888', "size": (resW, resH)},
-        lores={"format": 'YUV420', "size": (resW // 2, resH // 2)},
-        display="lores",
-        buffer_count=4  # Increase buffer for better performance
+        main={"format": 'RGB888', "size": (resW, resH)}
     )
     
-    # Configure camera with tuned parameters
+    # Configure camera
     cap.configure(config)
     
-    # Set camera controls for better performance
-    cap.set_controls({
-        "FrameDurationLimits": (33333, 33333),  # Target 30fps
-        "AnalogueGain": 1.0,
-        "ExposureTime": 20000,
-        "AeEnable": True,  # Auto exposure
-        "AwbEnable": True,  # Auto white balance
-    })
-    
-    # Start the camera
+    # Start the camera and allow time for auto-exposure to adjust
     cap.start()
+    time.sleep(1.0)
+
 else:
     print('Invalid source. Use "usb0" for webcam or "picamera0" for Pi Camera.')
     sys.exit(0)
@@ -143,6 +138,15 @@ while True:
 
             # Draw label
             label = f'{classname}: {int(conf*100)}%'
+
+            # Estimate and display distance if parameters are available
+            if focal_length_px and known_object_height_mm:
+                object_height_px = ymax - ymin
+                if object_height_px > 0:
+                    distance_mm = (known_object_height_mm * focal_length_px) / object_height_px
+                    distance_m = distance_mm / 1000
+                    label += f' {distance_m:.2f}m'
+
             labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             label_ymin = max(ymin, labelSize[1] + 10)
             cv2.rectangle(frame, (xmin, label_ymin-labelSize[1]-10), 
@@ -188,5 +192,3 @@ else:
 if record:
     recorder.release()
 cv2.destroyAllWindows()
-
-os.system('python yolo_detect.py')
