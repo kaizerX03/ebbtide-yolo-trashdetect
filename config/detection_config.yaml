@@ -2,7 +2,7 @@
 
 model:
   path: "/home/pi/yolo_env/ebb_ncnn_model"  # You can change this to your custom model path
-  confidence_threshold: 0.5
+  confidence_threshold: 0.4
 
 camera:
   source: "picamera0"  # Options: "usb0", "usb1", "picamera0" 
@@ -12,5 +12,18 @@ recording:
   enabled: false  # Set to true to record video output
 
 distance_estimation:
-  focal_length_px: 998.4
-  known_object_height_mm: 100
+  focal_length_px: 1250.35  # Use value from calibration_data.yaml (camera_matrix[1][1])
+  known_object_height_mm: 120  # Set to the real-world height of your object in mm
+
+pixhawk:
+  connection: "/dev/ttyACM0"  # Serial connection to Pixhawk (may be ttyACM0, ttyS0, etc.)
+  baud_rate: 57600           # Default baud rate for Pixhawk
+  control_enabled: false      # Set to true to enable navigation control
+  trash_collection_mode: "waypoint_override"  # Options: "direct_control" or "waypoint_override"
+
+test_mode:
+  enabled: false              # Set to true to enable test mode
+  save_detections: false      # Save detection frames to a folder
+  simulate_navigation: false  # Simulate navigation commands without sending to Pixhawk
+  overlay_predictions: true   # Show prediction overlays on screen (direction, distance predictions)
+  test_output_dir: "test_results"  # Directory to save test results
