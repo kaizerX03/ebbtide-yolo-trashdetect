@@ -1,8 +1,49 @@
-/bin
-/ebb_ncnn_model
-/include
-/lib
-/quick_test.jpg
-/runs
-/share
+# Calibration images and outputs
+calibration_images/*.jpg
+calibration_output/*.jpg
+calibration_output/*.npz
+
+# Runtime files
+*.avi
+*.mp4
+capture.png
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*.class
+
+# Environment files
+.env
+venv/
+
+# Model files
+ebb_ncnn_model/
+*.pt
+*.onnx
+*.weights
+*.bin
+runs/
+
+# Library and dependency directories
+lib/
+lib64/
+bin/
+share/
+include/
+*.so
+*.dll
+*.dylib
+
+# Editor specific files
+.vscode/
+.idea/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
 /lib64
