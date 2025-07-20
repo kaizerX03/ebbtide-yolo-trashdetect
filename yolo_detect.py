@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import yaml
+import math
 
 import cv2
 import numpy as np
@@ -143,9 +144,9 @@ def connect_pixhawk(connection_string='/dev/ttyAMA0', baud_rate=57600, timeout=3
         print("Setting all motors to neutral position...")
         # Clear any existing RC overrides
         vehicle.channels.overrides = {}
-        # Explicitly set motor channels to their specific neutral positions
-        vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-        vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+        # Explicitly set motor channels to their neutral positions
+        vehicle.channels.overrides['1'] = 1500  # Steering neutral (center)
+        vehicle.channels.overrides['3'] = 1500  # Throttle neutral (stop)
         
         return True
     except APIException as e:
@@ -214,6 +215,117 @@ def diagnostic_port_scan():
     return found_ports
 
 # ---------------------------
+# GPS and Navigation Functions
+# ---------------------------
+
+def calculate_target_bearing(frame, target_x, target_y):
+    """
+    Calculate the bearing from the boat to the target detected in the camera frame.
+    
+    Args:
+        frame: The camera frame
+        target_x: X coordinate of the target in the frame
+        target_y: Y coordinate of the target in the frame
+        
+    Returns:
+        relative_bearing: Bearing from the boat's heading to the target (-180 to +180 degrees)
+        absolute_bearing: Absolute bearing from North to the target (0-359 degrees)
+    """
+    # Get frame dimensions
+    height, width = frame.shape[0], frame.shape[1]
+    center_x, center_y = width // 2, height // 2
+    
+    # Calculate angle in degrees (-90 to +90) based on horizontal position
+    # Assuming camera has ~90 degree horizontal field of view
+    # Negative = target is to the left, Positive = target is to the right
+    horizontal_fov = 90  # Camera's approximate horizontal field of view (degrees)
+    x_offset = target_x - center_x
+    relative_bearing = (x_offset / (width / 2)) * (horizontal_fov / 2)
+    
+    # Get boat's current heading (0-359, 0=North)
+    boat_heading = 0
+    if vehicle is not None and vehicle.heading is not None:
+        boat_heading = vehicle.heading
+    
+    # Calculate absolute bearing (0-359, 0=North)
+    absolute_bearing = (boat_heading + relative_bearing) % 360
+    
+    return relative_bearing, absolute_bearing
+
+def get_gps_data():
+    """Get GPS coordinates and bearing from Pixhawk"""
+    if vehicle is None:
+        return None
+    
+    try:
+        lat = None
+        lon = None
+        alt = None
+        heading = None
+        
+        if vehicle.location.global_frame:
+            lat = vehicle.location.global_frame.lat
+            lon = vehicle.location.global_frame.lon
+            
+        if vehicle.location.global_relative_frame:
+            alt = vehicle.location.global_relative_frame.alt
+            
+        # Get heading (0-360 degrees, 0=North)
+        heading = vehicle.heading
+        
+        return {
+            "lat": lat,
+            "lon": lon,
+            "alt": alt,
+            "heading": heading,
+            "gps_fix": vehicle.gps_0.fix_type,
+            "satellites": vehicle.gps_0.satellites_visible
+        }
+    except Exception as e:
+        print(f"Error getting GPS data: {e}")
+        return None
+
+def display_gps_data(frame, gps_data):
+    """Display GPS coordinates and bearing on the frame"""
+    if gps_data is None:
+        return
+    
+    # Display GPS data at the top of the frame
+    if gps_data["lat"] is not None and gps_data["lon"] is not None:
+        gps_text = f"GPS: {gps_data['lat']:.6f}, {gps_data['lon']:.6f}"
+        cv2.putText(frame, gps_text, (10, 210), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    # Display altitude if available
+    if gps_data["alt"] is not None:
+        alt_text = f"ALT: {gps_data['alt']:.1f}m"
+        cv2.putText(frame, alt_text, (10, 240), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    # Display heading if available
+    if gps_data["heading"] is not None:
+        heading_text = f"HDG: {gps_data['heading']}°"
+        cv2.putText(frame, heading_text, (10, 270), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    # Display GPS fix quality
+    fix_type = gps_data["gps_fix"]
+    satellites = gps_data["satellites"]
+    
+    if fix_type >= 3:
+        fix_text = "3D FIX"
+        fix_color = (0, 255, 0)  # Green
+    elif fix_type == 2:
+        fix_text = "2D FIX"
+        fix_color = (0, 255, 255)  # Yellow
+    else:
+        fix_text = "NO FIX"
+        fix_color = (0, 0, 255)  # Red
+        
+    cv2.putText(frame, f"GPS: {fix_text} ({satellites} sats)", 
+                (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, fix_color, 2)
+
+# ---------------------------
 # Pixhawk Control Commands
 # ---------------------------
 
@@ -265,9 +377,9 @@ def arm_disarm(arm_command):
                     print("Vehicle armed!")
                     # Immediately set all motors to their specific neutral positions
                     print("Setting all motors to neutral position...")
-                    # Set motor channels directly to their specific neutral positions
-                    vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-                    vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+                    # Set motor channels to their neutral positions
+                    vehicle.channels.overrides['1'] = 1500  # Steering neutral (center)
+                    vehicle.channels.overrides['3'] = 1500  # Throttle neutral (stop)
                     return True
                 time.sleep(0.5)
             
@@ -435,18 +547,27 @@ detection_cooldown = 3.0  # Minimum time between motor activations (seconds)
 # Additional flag to simplify motor control logic
 motor_start_time = 0  # Time when motors were activated
 
-def handle_detections(detections, frame):
+def handle_detections(detections, frame, test_mode=None, test_values=None):
     """
-    Handle motor control based on detected objects.
+    Handle motor control based on detected objects or test mode.
     
     Args:
         detections: List of object detections
         frame: The current video frame
+        test_mode: String indicating test mode ('left_turn', 'right_turn', etc.)
+        test_values: Dictionary with test parameters like motor values
     """
     global vehicle, motor_control_enabled, last_detection_time, motor_active, motor_start_time
     
-    # If motor control is disabled or vehicle isn't connected, do nothing
-    if not motor_control_enabled or vehicle is None or not vehicle.armed:
+    # Print motor status at the start of each call for debugging
+    print(f"Motor status: active={motor_active}, time_elapsed={(time.time()-motor_start_time if motor_active else 'N/A')}")
+    
+    # Test mode overrides normal motor control checks
+    if test_mode is not None:
+        # Here we could handle specific test modes
+        pass
+    # Skip if motor control is disabled or vehicle isn't connected
+    elif not motor_control_enabled or vehicle is None or not vehicle.armed:
         return
     
     # Get current time
@@ -459,17 +580,14 @@ def handle_detections(detections, frame):
         if elapsed_time >= motor_run_time:
             # Motor run time complete - stop motors
             print("Motor run time complete (5s). Stopping motors.")
-            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
             
-            # Verify motors are at neutral
-            try:
-                time.sleep(0.1)  # Brief pause to allow values to take effect
-                actual_right = vehicle.channels['1']
-                actual_left = vehicle.channels['3']
-                print(f"MOTORS STOPPED - Actual values: Right={actual_right}, Left={actual_left}")
-            except Exception as e:
-                print(f"Could not read actual motor values: {e}")
+            # Directly set both motors to neutral in one operation
+            vehicle.channels.overrides = {
+                '1': 1500,  # Steering neutral (center)
+                '3': 1500   # Throttle neutral (stop)
+            }
+            
+            print("Motors stopped")
                 
             motor_active = False
             last_detection_time = current_time  # Start cooldown period
@@ -481,39 +599,14 @@ def handle_detections(detections, frame):
             # Motors still running - show countdown
             remaining_time = motor_run_time - elapsed_time
             
-            # Log actual motor values every 0.2 seconds for detailed diagnostics
-            if int(elapsed_time * 5) % 1 == 0:  # Log every 0.2 seconds
-                try:
-                    # First, check what's currently in the override dictionary
-                    override_dict = vehicle.channels.overrides.copy()
-                    
-                    # Get actual channel values
-                    actual_right = vehicle.channels['1']
-                    actual_left = vehicle.channels['3']
-                    
-                    # Log detailed information
-                    print(f"MOTORS DIAGNOSTIC [{elapsed_time:.1f}s]:")
-                    print(f"  Actual values: Right={actual_right}, Left={actual_left}")
-                    print(f"  Current overrides: {override_dict}")
-                    print(f"  Active vehicle mode: {vehicle.mode.name}")
-                    
-                    # Check for discrepancies
-                    if actual_right != 1894 or actual_left != 1894:
-                        print("ALERT: Motor value changed from maximum!")
-                        print(f"  Expected: Right=1894, Left=1894")
-                        print(f"  Actual: Right={actual_right}, Left={actual_left}")
-                        print("  Setting back to maximum...")
-                        
-                        # Reset to max power
-                        vehicle.channels.overrides['1'] = 1894  # Right motor at maximum
-                        vehicle.channels.overrides['3'] = 1894  # Left motor at maximum
-                except Exception as e:
-                    print(f"Error reading motor values: {e}")
+            # SIMPLIFIED: Always keep motors at max power without any conditional checks
+            # Set both motors to maximum every cycle to ensure they stay activated
+            vehicle.channels.overrides['1'] = 1894  # Right motor at maximum power
+            vehicle.channels.overrides['3'] = 1894  # Left motor at maximum power
             
-            # Keep motors at max power - simple refresh every second
-            if int(elapsed_time) % 1 == 0:  # Once per second is enough
-                vehicle.channels.overrides['1'] = 1894  # Right motor at maximum power
-                vehicle.channels.overrides['3'] = 1894  # Left motor at maximum power
+            # Only log occasionally for reduced interference
+            if int(elapsed_time) % 1 == 0:  # Log once per second
+                print(f"Motors running at maximum power: {elapsed_time:.1f}s elapsed, {remaining_time:.1f}s remaining")
             
             # Display motor status
             cv2.putText(frame, "MOTORS ACTIVATED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
@@ -553,77 +646,19 @@ def handle_detections(detections, frame):
     if has_detections:
         print("\nObject detected! Activating motors for 5 seconds")
         
-        # Set motors to maximum power
         try:
-            # Completely reset any existing overrides
-            vehicle.channels.overrides = {}
-            time.sleep(0.05)  # Brief pause
-            
-            # Print initial system state for diagnostics
-            print("\n==== MOTOR ACTIVATION DIAGNOSTICS ====")
-            print(f"Vehicle mode: {vehicle.mode.name}")
-            print(f"Armed state: {vehicle.armed}")
-            try:
-                print(f"RC Override before clearing: {vehicle.channels.overrides}")
-            except:
-                print("Could not read RC overrides")
-            
-            # Clear any existing overrides
-            print("Clearing all overrides...")
-            vehicle.channels.overrides = {}
-            time.sleep(0.05)  # Brief pause
-            
-            # Verify clearance
-            try:
-                print(f"RC Override after clearing: {vehicle.channels.overrides}")
-            except:
-                print("Could not read RC overrides")
-            
-            # Set both motors to full power
+            # SIMPLIFIED ACTIVATION: Set motors to maximum power directly
+            # Minimal diagnostic output, no verification or sleep calls
             print("Setting motors to maximum power...")
-            vehicle.channels.overrides['1'] = 1894  # Right motor at maximum
-            vehicle.channels.overrides['3'] = 1894  # Left motor at maximum
-            time.sleep(0.1)  # Allow values to take effect
             
-            # Diagnostic check to see what happened
-            try:
-                override_dict = vehicle.channels.overrides.copy()
-                actual_right = vehicle.channels['1']
-                actual_left = vehicle.channels['3']
-                
-                print(f"Current override dictionary: {override_dict}")
-                print(f"Actual channel values: Right={actual_right}, Left={actual_left}")
-                
-                # If values are not at max, investigate why
-                if actual_right != 1894 or actual_left != 1894:
-                    print("WARNING: Motor values not set to maximum!")
-                    print("Possible causes:")
-                    print("1. RC radio input may be overriding commands")
-                    print("2. Pixhawk safety features may be limiting values")
-                    print("3. Vehicle mode may not allow RC override")
-                    print("4. Channel mapping may be incorrect")
-                    
-                    # Try again with explicit assignment
-                    print("Attempting direct override...")
-                    vehicle.channels.overrides = {'1': 1894, '3': 1894}
-                    time.sleep(0.1)
-                    
-                    # Check again
-                    actual_right = vehicle.channels['1']
-                    actual_left = vehicle.channels['3']
-                    print(f"After direct override: Right={actual_right}, Left={actual_left}")
-            except Exception as e:
-                print(f"Diagnostic error: {e}")
+            # Direct override without clearing first - most reliable method for continuous control
+            vehicle.channels.overrides = {'1': 1894, '3': 1894}
             
-            print("==== END DIAGNOSTICS ====\n")
+            print(f"Motors activated for {motor_run_time} seconds")
             
             # Record start time and activate flag
             motor_start_time = current_time
-            motor_active = True
-            
-            # Record start time and activate flag
-            motor_start_time = current_time
-            motor_active = True
+            motor_active = True  # This flag ensures motors stay on for the full duration
             
             # Display activation message
             cv2.putText(frame, "MOTORS ACTIVATED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
@@ -703,11 +738,22 @@ def process_frame(frame):
                 min_center_dist = dist
                 most_centered_idx = i
 
-    # Highlight most centered object
+    # Highlight most centered object and calculate bearing
     if most_centered_idx is not None:
         cx, cy = centers[most_centered_idx]
         cv2.drawMarker(frame, (cx, cy), (0,255,0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
         cv2.putText(frame, 'MOST CENTERED', (cx-60, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        
+        # Calculate bearing to target
+        relative_bearing, absolute_bearing = calculate_target_bearing(frame, cx, cy)
+        
+        # Display bearing information
+        bearing_text = f"REL: {relative_bearing:.1f}° ABS: {absolute_bearing:.1f}°"
+        cv2.putText(frame, bearing_text, (cx-90, cy+30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                   
+        # Draw direction line from center to target
+        cv2.line(frame, frame_center, (cx, cy), (0, 255, 0), 2)
     
     # Periodic safety check - every 5 seconds perform a safety check
     # This helps catch cases where motors might be activated unintentionally
@@ -727,16 +773,16 @@ def process_frame(frame):
                 
                 # If motor control is disabled, check for incorrect values
                 if not motor_control_enabled:
-                    # Check if motors are significantly off from their specific neutral positions
-                    if abs(right_motor - 1335) > 50 or abs(left_motor - 1500) > 50:
+                    # Check if motors are significantly off from their neutral positions
+                    if abs(right_motor - 1500) > 50 or abs(left_motor - 1500) > 50:
                         print(f"SAFETY CHECK: Motors off neutral when they should be idle! " +
                               f"Right: {right_motor}, Left: {left_motor}")
-                        print("Forcing motors to their specific neutral positions...")
+                        print("Forcing motors to their neutral positions...")
                         # Return to neutral position using multiple approaches
                         clear_all_motor_overrides()
-                        control_motors(right_motor_value=1335, left_motor_value=1500)
-                        vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-                        vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+                        control_motors(right_motor_value=1500, left_motor_value=1500)
+                        vehicle.channels.overrides['1'] = 1500  # Steering neutral (center)
+                        vehicle.channels.overrides['3'] = 1500  # Throttle neutral (stop)
                         motors_forced_off = True
                         
                 # If motor control is enabled and motors active, log any interference
@@ -879,6 +925,10 @@ while True:
                 
     # Display armed status
     if vehicle is not None:
+        # Get and display GPS data
+        gps_data = get_gps_data()
+        display_gps_data(frame, gps_data)
+        
         if vehicle.armed:
             cv2.putText(frame, f'ARMED', (10,180),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)  # Red for armed
@@ -994,11 +1044,11 @@ while True:
         # Arm motors
         if vehicle:
             if arm_disarm(True):
-                # After successful arming, explicitly ensure motors are at their specific neutral positions
+                # After successful arming, explicitly ensure motors are at neutral positions
                 print("Setting all motors to neutral position after arming...")
-                # Set motor channels directly to their specific neutral positions
-                vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-                vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+                # Set motor channels to their neutral positions
+                vehicle.channels.overrides['1'] = 1500  # Steering neutral (center)
+                vehicle.channels.overrides['3'] = 1500  # Throttle neutral (stop)
         else:
             print("Pixhawk not connected! Connect first.")
     elif key == ord('f'):
@@ -1025,39 +1075,77 @@ while True:
             else:
                 print("Pixhawk not connected! Connect first.")
         else:
-            # Window in focus - test left motor (channel 3)
+            # Window in focus - test left motor (turn left)
             if vehicle and vehicle.armed:
-                print("\nTesting left motor (channel 3)...")
-                print("Setting to maximum throttle (1894) for 5 seconds...")
-                # Set right motor explicitly to its neutral and left motor to test value
-                vehicle.channels.overrides['1'] = 1335  # Right motor specific neutral
-                vehicle.channels.overrides['3'] = 1894  # Left motor maximum power
+                print("\nTesting left turn (differential thrust)...")
+                print("Setting throttle forward and steering left for 5 seconds...")
                 
-                # Keep power for full 5 seconds
-                print("Left motor activated at 1894 for 5 seconds...")
-                time.sleep(5.0)
+                # SIMPLIFIED: For differential thrust
+                # Direct control without any sleeps or checks in between
+                print("Left turn activated for 5 seconds...")
+                
+                # Set initial values directly
+                vehicle.channels.overrides = {
+                    '3': 1700,  # Throttle forward (1700 = moderate speed)
+                    '1': 1103   # Steering full left
+                }
+                
+                # Wait for full duration without any checks
+                start_time = time.time()
+                
+                # Refresh values continuously in a tight loop without any sleeps
+                while time.time() < start_time + 5.0:
+                    # Always maintain the values at every loop iteration
+                    vehicle.channels.overrides['3'] = 1700
+                    vehicle.channels.overrides['1'] = 1103
+                    
+                    # Add brief sleep to avoid overwhelming the Pixhawk
+                    # This sleep is much shorter than before
+                    time.sleep(0.05)
                 
                 # Return to neutral position
-                vehicle.channels.overrides['3'] = 1500  # Left motor specific neutral
-                print("Left motor test complete")
+                vehicle.channels.overrides = {
+                    '1': 1500,  # Steering neutral (center)
+                    '3': 1500   # Throttle neutral (stop)
+                }
+                print("Left turn test complete")
             else:
                 print("Pixhawk not connected or not armed! Connect and arm first.")
     elif key == ord('r'):
-        # Test right motor (channel 1)
+        # Test right turn (differential thrust)
         if vehicle and vehicle.armed:
-            print("\nTesting right motor (channel 1)...")
-            print("Setting to maximum throttle (1894) for 5 seconds...")
-            # Set left motor explicitly to its neutral and right motor to test value
-            vehicle.channels.overrides['3'] = 1500  # Left motor neutral
-            vehicle.channels.overrides['1'] = 1894  # Right motor maximum power
+            print("\nTesting right turn (differential thrust)...")
+            print("Setting throttle forward and steering right for 5 seconds...")
             
-            # Keep power for full 5 seconds
-            print("Right motor activated at 1894 for 5 seconds...")
-            time.sleep(5.0)
+            # SIMPLIFIED: For differential thrust
+            # Direct control without any sleeps or checks in between
+            print("Right turn activated for 5 seconds...")
+            
+            # Set initial values directly
+            vehicle.channels.overrides = {
+                '3': 1700,  # Throttle forward (1700 = moderate speed)
+                '1': 1890   # Steering full right
+            }
+            
+            # Wait for full duration without any checks
+            start_time = time.time()
+            
+            # Refresh values continuously in a tight loop without any sleeps
+            while time.time() < start_time + 5.0:
+                # Always maintain the values at every loop iteration
+                vehicle.channels.overrides['3'] = 1700
+                vehicle.channels.overrides['1'] = 1890
+                
+                # Add brief sleep to avoid overwhelming the Pixhawk
+                # This sleep is much shorter than before
+                time.sleep(0.05)
             
             # Return to neutral position
-            vehicle.channels.overrides['1'] = 1335  # Right motor specific neutral
-            print("Right motor test complete")
+            vehicle.channels.overrides = {
+                '1': 1500,  # Steering neutral (center)
+                '3': 1500   # Throttle neutral (stop)
+            }
+            print("Right turn test complete")
         else:
             print("Pixhawk not connected or not armed! Connect and arm first.")
     elif key == ord('e'):
@@ -1077,12 +1165,12 @@ while True:
 
         # If we're disabling, make sure motors are at neutral
         if not motor_control_enabled and vehicle and vehicle.armed:
-            print("Disabling motor control and setting motors to their specific neutral positions")
+            print("Disabling motor control and setting motors to their neutral positions")
             # Reset motor active flag
             motor_active = False
-            # Set motors directly to their specific neutral positions
-            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+            # Set motors to their neutral positions
+            vehicle.channels.overrides['1'] = 1500  # Steering neutral (center)
+            vehicle.channels.overrides['3'] = 1500  # Throttle neutral (stop)
     elif key == ord('z'):
         # Return to launch
         if vehicle:
@@ -1123,8 +1211,8 @@ if vehicle is not None:
         clear_all_motor_overrides()
         
         # 3. Set individual channels again to ensure correct neutral positions
-        vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-        vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+        vehicle.channels.overrides['1'] = 1500  # Steering neutral (center)
+        vehicle.channels.overrides['3'] = 1500  # Throttle neutral (stop)
         
         # 4. Wait a moment and clear again
         time.sleep(0.5)
