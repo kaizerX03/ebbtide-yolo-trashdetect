@@ -435,18 +435,105 @@ detection_cooldown = 3.0  # Minimum time between motor activations (seconds)
 # Additional flag to simplify motor control logic
 motor_start_time = 0  # Time when motors were activated
 
+# Mode switching control
+mode_switch_on_detection = True  # Flag to enable automatic mode switching on detection (always on)
+original_mode = None  # Store original mode to switch back if needed
+mode_switch_time = 0  # When we switched modes
+mode_switch_duration = 10.0  # How long to stay in GUIDED mode after last detection (seconds)
+in_detection_mode = False  # Flag to indicate we're in detection handling mode
+last_detection_confirmed_time = time.time()  # Initialize with current time to prevent errors
+
 def handle_detections(detections, frame):
     """
-    Handle motor control based on detected objects.
+    Handle motor control and mode switching based on detected objects.
     
     Args:
         detections: List of object detections
         frame: The current video frame
     """
     global vehicle, motor_control_enabled, last_detection_time, motor_active, motor_start_time
+    global mode_switch_on_detection, original_mode, mode_switch_time, in_detection_mode
     
-    # If motor control is disabled or vehicle isn't connected, do nothing
-    if not motor_control_enabled or vehicle is None or not vehicle.armed:
+    # If vehicle isn't connected, do nothing
+    if vehicle is None or not vehicle.armed:
+        return
+    
+    # Get current time
+    current_time = time.time()
+    
+    # Handle mode switching automatically based on detections
+    # This always runs because mode_switch_on_detection is always True
+    
+    # First check for detections to determine if we should enter GUIDED mode
+    has_detections = False
+    for detection in detections:
+        conf = detection.conf.item()
+        if conf > min_thresh:
+            has_detections = True
+            # Update time of last detection - need to use global keyword
+            global last_detection_confirmed_time
+            last_detection_confirmed_time = current_time
+            break
+    
+    current_mode = vehicle.mode.name
+    
+    # If we have detections and we're not already in GUIDED mode, switch to GUIDED
+    if has_detections and current_mode == 'AUTO' and not in_detection_mode:
+        # Store the original mode so we can switch back later
+        original_mode = current_mode
+        
+        print(f"\nDetection triggered auto mode switch! Current mode: {current_mode}")
+        print(f"Switching to GUIDED mode for object handling")
+        
+        # Switch to GUIDED mode
+        try:
+            vehicle.mode = VehicleMode('GUIDED')
+            in_detection_mode = True
+            mode_switch_time = current_time
+            
+            # Safety first - stop the vehicle by setting motors to neutral
+            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
+            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+            
+            # Show mode switch notification
+            cv2.putText(frame, f"SWITCHING MODES: {current_mode} → GUIDED", 
+                      (frame.shape[1]//2 - 180, frame.shape[0]//2 - 120),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        except Exception as e:
+            print(f"Error switching mode: {e}")
+    
+    # If we're in detection mode, show status and check for switching back
+    if in_detection_mode:
+        # If we have no detections for the duration period, switch back to original mode
+        time_since_last_detection = current_time - last_detection_confirmed_time
+        if time_since_last_detection >= mode_switch_duration:
+            # Switch back to original mode
+            if original_mode is not None:
+                print(f"\nNo detections for {mode_switch_duration} seconds.")
+                print(f"Switching back to {original_mode} mode")
+                try:
+                    vehicle.mode = VehicleMode(original_mode)
+                    in_detection_mode = False
+                    original_mode = None
+                except Exception as e:
+                    print(f"Error switching back to original mode: {e}")
+        
+        # Show mode information on screen
+        cv2.putText(frame, f"DETECTION MODE: GUIDED", (frame.shape[1]//2 - 150, frame.shape[0]//2 - 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        
+        if has_detections:
+            cv2.putText(frame, f"Object detected - holding in GUIDED mode", 
+                       (frame.shape[1]//2 - 180, frame.shape[0]//2 - 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        else:
+            remaining_time = mode_switch_duration - time_since_last_detection
+            cv2.putText(frame, f"No detections - returning to {original_mode} in: {remaining_time:.1f}s", 
+                       (frame.shape[1]//2 - 200, frame.shape[0]//2 - 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    
+    # If motor control is disabled, still allow mode switching but don't control motors
+    if not motor_control_enabled:
         return
     
     # Get current time
@@ -458,62 +545,31 @@ def handle_detections(detections, frame):
         elapsed_time = current_time - motor_start_time
         if elapsed_time >= motor_run_time:
             # Motor run time complete - stop motors
-            print("Motor run time complete (5s). Stopping motors.")
-            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+            print("\nMotor run time complete (5s). Stopping motors.")
+            # Set directly to neutral values with no checks
+            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment
             
-            # Verify motors are at neutral
-            try:
-                time.sleep(0.1)  # Brief pause to allow values to take effect
-                actual_right = vehicle.channels['1']
-                actual_left = vehicle.channels['3']
-                print(f"MOTORS STOPPED - Actual values: Right={actual_right}, Left={actual_left}")
-            except Exception as e:
-                print(f"Could not read actual motor values: {e}")
-                
+            # Record stop time and state
             motor_active = False
             last_detection_time = current_time  # Start cooldown period
             
             # Show motor stopped message
             cv2.putText(frame, "MOTORS STOPPED", (frame.shape[1]//2 - 120, frame.shape[0]//2),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            
+            print("Motors returned to neutral position")
         else:
             # Motors still running - show countdown
             remaining_time = motor_run_time - elapsed_time
             
-            # Log actual motor values every 0.2 seconds for detailed diagnostics
-            if int(elapsed_time * 5) % 1 == 0:  # Log every 0.2 seconds
-                try:
-                    # First, check what's currently in the override dictionary
-                    override_dict = vehicle.channels.overrides.copy()
-                    
-                    # Get actual channel values
-                    actual_right = vehicle.channels['1']
-                    actual_left = vehicle.channels['3']
-                    
-                    # Log detailed information
-                    print(f"MOTORS DIAGNOSTIC [{elapsed_time:.1f}s]:")
-                    print(f"  Actual values: Right={actual_right}, Left={actual_left}")
-                    print(f"  Current overrides: {override_dict}")
-                    print(f"  Active vehicle mode: {vehicle.mode.name}")
-                    
-                    # Check for discrepancies
-                    if actual_right != 1894 or actual_left != 1894:
-                        print("ALERT: Motor value changed from maximum!")
-                        print(f"  Expected: Right=1894, Left=1894")
-                        print(f"  Actual: Right={actual_right}, Left={actual_left}")
-                        print("  Setting back to maximum...")
-                        
-                        # Reset to max power
-                        vehicle.channels.overrides['1'] = 1894  # Right motor at maximum
-                        vehicle.channels.overrides['3'] = 1894  # Left motor at maximum
-                except Exception as e:
-                    print(f"Error reading motor values: {e}")
+            # SIMPLIFIED APPROACH: Just keep motors at max power
+            # No checks, no diagnostics that might interfere
+            # Simply enforce maximum power throughout the entire 5-second duration
+            vehicle.channels.overrides = {'1': 1894, '3': 1894}  # Direct assignment
             
-            # Keep motors at max power - simple refresh every second
-            if int(elapsed_time) % 1 == 0:  # Once per second is enough
-                vehicle.channels.overrides['1'] = 1894  # Right motor at maximum power
-                vehicle.channels.overrides['3'] = 1894  # Left motor at maximum power
+            # Only log status once per second without any checks or modifications
+            if int(elapsed_time) % 1 == 0:  # Log once per second
+                print(f"Motors running at maximum power: {elapsed_time:.1f}s of {motor_run_time}s")
             
             # Display motor status
             cv2.putText(frame, "MOTORS ACTIVATED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
@@ -549,81 +605,24 @@ def handle_detections(detections, frame):
             has_detections = True
             break
     
-    # If we have detections, activate motors for the full runtime
+    # If we have detections, proceed with motor activation
     if has_detections:
-        print("\nObject detected! Activating motors for 5 seconds")
+        print("\nObject detected!")
         
-        # Set motors to maximum power
-        try:
-            # Completely reset any existing overrides
-            vehicle.channels.overrides = {}
-            time.sleep(0.05)  # Brief pause
+        # If motor control is enabled, activate motors
+        if motor_control_enabled:
+            print("\nACTIVATING MOTORS FOR 5 SECONDS")
             
-            # Print initial system state for diagnostics
-            print("\n==== MOTOR ACTIVATION DIAGNOSTICS ====")
-            print(f"Vehicle mode: {vehicle.mode.name}")
-            print(f"Armed state: {vehicle.armed}")
-            try:
-                print(f"RC Override before clearing: {vehicle.channels.overrides}")
-            except:
-                print("Could not read RC overrides")
+            # SIMPLIFIED APPROACH: Just set motors to maximum directly
+            # No checks, no diagnostics that might interfere
+            vehicle.channels.overrides = {'1': 1894, '3': 1894}  # Direct assignment to dictionary
             
-            # Clear any existing overrides
-            print("Clearing all overrides...")
-            vehicle.channels.overrides = {}
-            time.sleep(0.05)  # Brief pause
-            
-            # Verify clearance
-            try:
-                print(f"RC Override after clearing: {vehicle.channels.overrides}")
-            except:
-                print("Could not read RC overrides")
-            
-            # Set both motors to full power
-            print("Setting motors to maximum power...")
-            vehicle.channels.overrides['1'] = 1894  # Right motor at maximum
-            vehicle.channels.overrides['3'] = 1894  # Left motor at maximum
-            time.sleep(0.1)  # Allow values to take effect
-            
-            # Diagnostic check to see what happened
-            try:
-                override_dict = vehicle.channels.overrides.copy()
-                actual_right = vehicle.channels['1']
-                actual_left = vehicle.channels['3']
-                
-                print(f"Current override dictionary: {override_dict}")
-                print(f"Actual channel values: Right={actual_right}, Left={actual_left}")
-                
-                # If values are not at max, investigate why
-                if actual_right != 1894 or actual_left != 1894:
-                    print("WARNING: Motor values not set to maximum!")
-                    print("Possible causes:")
-                    print("1. RC radio input may be overriding commands")
-                    print("2. Pixhawk safety features may be limiting values")
-                    print("3. Vehicle mode may not allow RC override")
-                    print("4. Channel mapping may be incorrect")
-                    
-                    # Try again with explicit assignment
-                    print("Attempting direct override...")
-                    vehicle.channels.overrides = {'1': 1894, '3': 1894}
-                    time.sleep(0.1)
-                    
-                    # Check again
-                    actual_right = vehicle.channels['1']
-                    actual_left = vehicle.channels['3']
-                    print(f"After direct override: Right={actual_right}, Left={actual_left}")
-            except Exception as e:
-                print(f"Diagnostic error: {e}")
-            
-            print("==== END DIAGNOSTICS ====\n")
-            
-            # Record start time and activate flag
+            # Record start time and activate flag immediately
             motor_start_time = current_time
             motor_active = True
             
-            # Record start time and activate flag
-            motor_start_time = current_time
-            motor_active = True
+            print(f"Motors set to maximum power for {motor_run_time} seconds")
+            print(f"Current mode: {vehicle.mode.name}")
             
             # Display activation message
             cv2.putText(frame, "MOTORS ACTIVATED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
@@ -638,8 +637,6 @@ def handle_detections(detections, frame):
             time_text = f"Motors: {motor_run_time:.1f}s remaining"
             cv2.putText(frame, time_text, (frame.shape[1]//2 - 120, frame.shape[0]//2 + 80),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        except Exception as e:
-            print(f"Error setting motor speeds: {e}")
 
 def process_frame(frame):
     """Run detection and annotate frame."""
@@ -709,53 +706,28 @@ def process_frame(frame):
         cv2.drawMarker(frame, (cx, cy), (0,255,0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
         cv2.putText(frame, 'MOST CENTERED', (cx-60, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
     
-    # Periodic safety check - every 5 seconds perform a safety check
-    # This helps catch cases where motors might be activated unintentionally
-    global motors_forced_off
-    current_time = time.time()
-    
-    # DEBUGGING: Log the safety check execution when motors are active
-    if motor_active and (int(current_time) % 5 == 0) and not motors_forced_off:
-        print("\n[DEBUG] Safety check running while motors active - checking for interference...")
-    
-    if vehicle is not None and vehicle.armed:
+    # Simplified safety check
+    # Only run if motors are NOT active to avoid interference with active motor control
+    current_time = time.time()  # Get current time for safety check
+    if vehicle is not None and vehicle.armed and not motor_active:
         # Only check every 5 seconds to avoid flooding console
-        if (int(current_time) % 5 == 0) and not motors_forced_off:
+        if int(current_time) % 5 == 0:
             try:
-                right_motor = vehicle.channels['1'] 
-                left_motor = vehicle.channels['3']
-                
-                # If motor control is disabled, check for incorrect values
+                # Only check when motors should be idle (not in active motor control period)
                 if not motor_control_enabled:
+                    right_motor = vehicle.channels['1']
+                    left_motor = vehicle.channels['3']
+                    
                     # Check if motors are significantly off from their specific neutral positions
                     if abs(right_motor - 1335) > 50 or abs(left_motor - 1500) > 50:
-                        print(f"SAFETY CHECK: Motors off neutral when they should be idle! " +
-                              f"Right: {right_motor}, Left: {left_motor}")
-                        print("Forcing motors to their specific neutral positions...")
-                        # Return to neutral position using multiple approaches
-                        clear_all_motor_overrides()
-                        control_motors(right_motor_value=1335, left_motor_value=1500)
-                        vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-                        vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
-                        motors_forced_off = True
+                        print(f"\nSAFETY CHECK: Motors off neutral when they should be idle!")
+                        print(f"Values: Right={right_motor}, Left={left_motor}")
+                        print("Setting motors to neutral positions...")
                         
-                # If motor control is enabled and motors active, log any interference
-                elif motor_control_enabled and motor_active:
-                    # Check if motors are significantly off from their maximum values
-                    if abs(right_motor - 1894) > 50 or abs(left_motor - 1894) > 50:
-                        print(f"SAFETY CHECK INTERFERENCE: Motors changed from maximum during active period!")
-                        print(f"Expected: Right=1894, Left=1894")
-                        print(f"Actual: Right={right_motor}, Left={left_motor}")
-                        print(f"Current vehicle mode: {vehicle.mode.name}")
-                        print(f"Current override dict: {vehicle.channels.overrides}")
-                        
-                        # Don't reset values here - this is just for diagnosis
-                        
+                        # Set motors to neutral with direct dictionary assignment
+                        vehicle.channels.overrides = {'1': 1335, '3': 1500}
             except Exception as e:
                 print(f"Safety check error: {e}")
-                
-    elif int(current_time) % 5 != 0:
-        motors_forced_off = False  # Reset the flag when not on a 5-second mark
         
     return frame, object_count
 
@@ -774,6 +746,7 @@ print("  'h': Show Pixhawk command help")
 print("  'e': Enable/disable motor control on detection")
 print("  'r': Test right motor (channel 1)")
 print("  'l': Test left motor (channel 3)")
+# Mode switching is now automatic
 
 avg_frame_rate = 0
 frame_rate_buffer = []
@@ -877,10 +850,14 @@ while True:
     cv2.putText(frame, f'Motor Control: {motor_status}', (10,150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, motor_color, 2)
                 
+    # Display mode switching status (always enabled)
+    cv2.putText(frame, f'Auto Mode Switch: ENABLED', (10,180),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)  # Always red since it's always on
+                
     # Display armed status
     if vehicle is not None:
         if vehicle.armed:
-            cv2.putText(frame, f'ARMED', (10,180),
+            cv2.putText(frame, f'ARMED', (10,210),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)  # Red for armed
             
             # Check if motors are running when they shouldn't be
@@ -902,8 +879,12 @@ while True:
             except:
                 pass  # Skip if can't read channels
         else:
-            cv2.putText(frame, f'DISARMED', (10,180),
+            cv2.putText(frame, f'DISARMED', (10,210),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)  # Green for disarmed
+        
+        # Display current flight mode
+        cv2.putText(frame, f'Mode: {vehicle.mode.name}', (10,240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)  # Yellow for mode
     frame_center = (resW // 2, resH // 2)
     cv2.line(frame, (frame_center[0], 0), (frame_center[0], resH), (0, 255, 255), 2)
     cv2.line(frame, (0, frame_center[1]), (resW, frame_center[1]), (0, 255, 255), 2)
@@ -968,6 +949,8 @@ while True:
             available_modes = ['STABILIZE', 'ALT_HOLD', 'LOITER', 'GUIDED', 'AUTO', 'RTL', 'LAND']
             print("\nAvailable flight modes:", ", ".join(available_modes))
             print("Current mode:", vehicle.mode.name)
+            print("NOTE: Mode switching is now automatic based on detections")
+            print("Current mode:", vehicle.mode.name)
             print("Enter first letter of mode or full mode name (e.g., 's' or 'STABILIZE')")
             cv2.putText(frame, "Enter mode in terminal", (resW//3, resH//2), 
                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
@@ -1017,7 +1000,17 @@ while True:
         else:
             print("Pixhawk not connected! Connect first.")
     elif key == ord('l'):
-        # Either Land mode or test left motor depending on modifier key
+        # Land the vehicle
+        if vehicle:
+            try:
+                print("\nAttempting to switch to LAND mode...")
+                vehicle.mode = VehicleMode("LAND")
+                time.sleep(0.5)
+                print(f"Current mode: {vehicle.mode.name}")
+            except Exception as e:
+                print(f"Error changing to LAND mode: {e}")
+        else:
+            print("No connection to vehicle. Cannot land.")# Either Land mode or test left motor depending on modifier key
         if cv2.getWindowProperty('YOLO Detection', cv2.WND_PROP_VISIBLE) < 1:
             # Window not in focus, assume terminal is - this is for Land mode
             if vehicle:
@@ -1072,8 +1065,8 @@ while True:
         cv2.putText(temp_frame, message, (resW//4, resH//2), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, 
                    (0,0,255) if motor_control_enabled else (0,255,0), 3)
-        cv2.imshow('YOLO Detection', temp_frame)
-        cv2.waitKey(1000)  # Show message for 1 second
+        
+    # No longer need to toggle mode switching as it's always enabled
 
         # If we're disabling, make sure motors are at neutral
         if not motor_control_enabled and vehicle and vehicle.armed:
@@ -1084,7 +1077,14 @@ while True:
             vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
             vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
     elif key == ord('z'):
-        # Return to launch
+        # Return to Launch
+        if vehicle:
+            if set_flight_mode('RTL'):
+                print("Vehicle returning to launch point")
+            else:
+                print("Failed to enter RTL mode")
+        else:
+            print("Pixhawk not connected! Connect first.")# Return to launch
         if vehicle:
             set_flight_mode('RTL')
         else:
