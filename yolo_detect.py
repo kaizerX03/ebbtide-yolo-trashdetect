@@ -477,17 +477,17 @@ def handle_detections(detections, frame):
     
     current_mode = vehicle.mode.name
     
-    # If we have detections and we're not already in GUIDED mode, switch to GUIDED
+    # If we have detections and we're not already in MANUAL mode, switch to MANUAL
     if has_detections and current_mode == 'AUTO' and not in_detection_mode:
         # Store the original mode so we can switch back later
         original_mode = current_mode
         
         print(f"\nDetection triggered auto mode switch! Current mode: {current_mode}")
-        print(f"Switching to GUIDED mode for object handling")
+        print(f"Switching to MANUAL mode for object handling")
         
-        # Switch to GUIDED mode
+        # Switch to MANUAL mode
         try:
-            vehicle.mode = VehicleMode('GUIDED')
+            vehicle.mode = VehicleMode('MANUAL')
             in_detection_mode = True
             mode_switch_time = current_time
             
@@ -496,7 +496,7 @@ def handle_detections(detections, frame):
             vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
             
             # Show mode switch notification
-            cv2.putText(frame, f"SWITCHING MODES: {current_mode} → GUIDED", 
+            cv2.putText(frame, f"SWITCHING MODES: {current_mode} → MANUAL", 
                       (frame.shape[1]//2 - 180, frame.shape[0]//2 - 120),
                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         except Exception as e:
@@ -515,11 +515,23 @@ def handle_detections(detections, frame):
                     vehicle.mode = VehicleMode(original_mode)
                     in_detection_mode = False
                     original_mode = None
+                    
+                    # Now that we're switching back to AUTO mode, display a clear message
+                    print("Mode switch complete - Resuming motion in AUTO mode")
+                    
+                    # Make sure we're not setting overrides anymore
+                    # This allows the AUTO mode to take full control
+                    vehicle.channels.overrides = {}
+                    
+                    # Draw a message indicating motion is resuming
+                    cv2.putText(frame, "RETURNING TO AUTO - RESUMING MOTION", 
+                              (frame.shape[1]//2 - 240, frame.shape[0]//2),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
                 except Exception as e:
                     print(f"Error switching back to original mode: {e}")
         
         # Show mode information on screen
-        cv2.putText(frame, f"DETECTION MODE: GUIDED", (frame.shape[1]//2 - 150, frame.shape[0]//2 - 80),
+        cv2.putText(frame, f"DETECTION MODE: MANUAL", (frame.shape[1]//2 - 150, frame.shape[0]//2 - 80),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         
         if has_detections:
@@ -539,51 +551,58 @@ def handle_detections(detections, frame):
     # Get current time
     current_time = time.time()
     
-    # STAGE 1: MOTORS ACTIVE - Motors are currently running
+    # STAGE 1: MOTORS ACTIVE - Motors are currently paused
     if motor_active:
-        # Check if the full run time has elapsed
+        # Check if the full pause time has elapsed
         elapsed_time = current_time - motor_start_time
         if elapsed_time >= motor_run_time:
-            # Motor run time complete - stop motors
-            print("\nMotor run time complete (5s). Stopping motors.")
-            # Set directly to neutral values with no checks
-            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment
+            # Motor pause time complete - mark pause as complete but keep motors neutral
+            print("\nPause time complete (5s). Staying in MANUAL mode until countdown completes.")
             
-            # Record stop time and state
+            # Record stop time and state but keep motors at neutral until mode switch completes
             motor_active = False
             last_detection_time = current_time  # Start cooldown period
             
-            # Show motor stopped message
-            cv2.putText(frame, "MOTORS STOPPED", (frame.shape[1]//2 - 120, frame.shape[0]//2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            
-            print("Motors returned to neutral position")
+            # Continue enforcing neutral position while in detection mode
+            if in_detection_mode:
+                vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Keep motors at neutral
+                
+                # Show status message
+                cv2.putText(frame, "PAUSE COMPLETE - AWAITING MODE SWITCH", (frame.shape[1]//2 - 220, frame.shape[0]//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+                
+                print("Continuing to hold position until 10s detection countdown completes")
+            else:
+                # If not in detection mode (unusual case), resume motion
+                cv2.putText(frame, "MOTION RESUMED", (frame.shape[1]//2 - 120, frame.shape[0]//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                print("Resumed motion after pause")
         else:
-            # Motors still running - show countdown
+            # Motors still paused - show countdown
             remaining_time = motor_run_time - elapsed_time
             
-            # SIMPLIFIED APPROACH: Just keep motors at max power
+            # SIMPLIFIED APPROACH: Keep motors at neutral
             # No checks, no diagnostics that might interfere
-            # Simply enforce maximum power throughout the entire 5-second duration
-            vehicle.channels.overrides = {'1': 1894, '3': 1894}  # Direct assignment
+            # Simply enforce neutral position throughout the entire 5-second duration
+            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment
             
             # Only log status once per second without any checks or modifications
             if int(elapsed_time) % 1 == 0:  # Log once per second
-                print(f"Motors running at maximum power: {elapsed_time:.1f}s of {motor_run_time}s")
+                print(f"Motors paused: {elapsed_time:.1f}s of {motor_run_time}s")
             
             # Display motor status
-            cv2.putText(frame, "MOTORS ACTIVATED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            cv2.putText(frame, "MOTORS PAUSED", (frame.shape[1]//2 - 120, frame.shape[0]//2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             
             # Show motor values on screen
-            motor_text = f"R:1894 L:1894"
+            motor_text = f"R:1335 L:1500"
             cv2.putText(frame, motor_text, (frame.shape[1]//2 - 80, frame.shape[0]//2 + 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
             # Show remaining time for motors to run
-            time_text = f"Motors: {remaining_time:.1f}s remaining"
+            time_text = f"Paused: {remaining_time:.1f}s remaining"
             cv2.putText(frame, time_text, (frame.shape[1]//2 - 120, frame.shape[0]//2 + 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
         return  # Skip all other detection while motors are active
     
@@ -605,38 +624,38 @@ def handle_detections(detections, frame):
             has_detections = True
             break
     
-    # If we have detections, proceed with motor activation
+    # If we have detections, stop motors instead of activating them
     if has_detections:
         print("\nObject detected!")
         
-        # If motor control is enabled, activate motors
+        # If motor control is enabled, stop motors for the pause duration
         if motor_control_enabled:
-            print("\nACTIVATING MOTORS FOR 5 SECONDS")
+            print("\nSTOPPING MOTORS FOR 5 SECONDS")
             
-            # SIMPLIFIED APPROACH: Just set motors to maximum directly
+            # SIMPLIFIED APPROACH: Just set motors to neutral directly
             # No checks, no diagnostics that might interfere
-            vehicle.channels.overrides = {'1': 1894, '3': 1894}  # Direct assignment to dictionary
+            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment to neutral positions
             
             # Record start time and activate flag immediately
             motor_start_time = current_time
             motor_active = True
             
-            print(f"Motors set to maximum power for {motor_run_time} seconds")
+            print(f"Motors stopped for {motor_run_time} seconds")
             print(f"Current mode: {vehicle.mode.name}")
             
             # Display activation message
-            cv2.putText(frame, "MOTORS ACTIVATED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            cv2.putText(frame, "MOTORS STOPPED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             
             # Show motor values
-            motor_text = f"R:1894 L:1894"
+            motor_text = f"R:1335 L:1500"
             cv2.putText(frame, motor_text, (frame.shape[1]//2 - 80, frame.shape[0]//2 + 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
             # Show full run time at start
-            time_text = f"Motors: {motor_run_time:.1f}s remaining"
+            time_text = f"Paused: {motor_run_time:.1f}s remaining"
             cv2.putText(frame, time_text, (frame.shape[1]//2 - 120, frame.shape[0]//2 + 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
 def process_frame(frame):
     """Run detection and annotate frame."""
@@ -743,7 +762,7 @@ print("  'p': Save screenshot")
 print("  'c': Reconnect to Pixhawk (if disconnected)")
 print("  'd': Run diagnostic port scan")
 print("  'h': Show Pixhawk command help")
-print("  'e': Enable/disable motor control on detection")
+print("  'e': Enable/disable motor pause on detection")
 print("  'r': Test right motor (channel 1)")
 print("  'l': Test left motor (channel 3)")
 # Mode switching is now automatic
@@ -844,10 +863,10 @@ while True:
         cv2.putText(frame, f'Pixhawk: {connection_status}', (10,120), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                     
-    # Display motor control status
+    # Display motor pause status
     motor_status = "ENABLED" if motor_control_enabled else "DISABLED"
     motor_color = (0,0,255) if motor_control_enabled else (0,255,0)  # Red if enabled, green if disabled
-    cv2.putText(frame, f'Motor Control: {motor_status}', (10,150),
+    cv2.putText(frame, f'Motor Pause: {motor_status}', (10,150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, motor_color, 2)
                 
     # Display mode switching status (always enabled)
@@ -1054,14 +1073,14 @@ while True:
         else:
             print("Pixhawk not connected or not armed! Connect and arm first.")
     elif key == ord('e'):
-        # Toggle detection-based motor control
+        # Toggle detection-based motor pause
         motor_control_enabled = not motor_control_enabled
         status = "ENABLED" if motor_control_enabled else "DISABLED"
-        print(f"\nMotor control on detection {status}")
+        print(f"\nMotor pause on detection {status}")
         
         # Display temporary message on screen
         temp_frame = frame.copy()
-        message = f"Motor Control: {status}"
+        message = f"Motor Pause: {status}"
         cv2.putText(temp_frame, message, (resW//4, resH//2), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, 
                    (0,0,255) if motor_control_enabled else (0,255,0), 3)
