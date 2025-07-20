@@ -495,10 +495,12 @@ def handle_detections(detections, frame):
             vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
             vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
             
-            # Show mode switch notification
-            cv2.putText(frame, f"SWITCHING MODES: {current_mode} → MANUAL", 
-                      (frame.shape[1]//2 - 180, frame.shape[0]//2 - 120),
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            # Show mode switch notification (centered)
+            text = f"SWITCHING MODES: {current_mode} → MANUAL"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, 
+                      (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 30),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         except Exception as e:
             print(f"Error switching mode: {e}")
     
@@ -523,26 +525,34 @@ def handle_detections(detections, frame):
                     # This allows the AUTO mode to take full control
                     vehicle.channels.overrides = {}
                     
-                    # Draw a message indicating motion is resuming
-                    cv2.putText(frame, "RETURNING TO AUTO - RESUMING MOTION", 
-                              (frame.shape[1]//2 - 240, frame.shape[0]//2),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    # Draw a message indicating motion is resuming (moved to bottom)
+                    text = "RETURNING TO AUTO - RESUMING MOTION"
+                    textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    cv2.putText(frame, text, 
+                              (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 except Exception as e:
                     print(f"Error switching back to original mode: {e}")
         
-        # Show mode information on screen
-        cv2.putText(frame, f"DETECTION MODE: MANUAL", (frame.shape[1]//2 - 150, frame.shape[0]//2 - 80),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        # Show mode information on screen (centered)
+        text = f"DETECTION MODE: MANUAL"
+        textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         if has_detections:
-            cv2.putText(frame, f"Object detected - holding in GUIDED mode", 
-                       (frame.shape[1]//2 - 180, frame.shape[0]//2 - 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            text = f"Object detected - holding in MANUAL mode"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, 
+                       (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         else:
             remaining_time = mode_switch_duration - time_since_last_detection
-            cv2.putText(frame, f"No detections - returning to {original_mode} in: {remaining_time:.1f}s", 
-                       (frame.shape[1]//2 - 200, frame.shape[0]//2 - 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            text = f"No detections - returning to {original_mode} in: {remaining_time:.1f}s"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, 
+                       (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     
     # If motor control is disabled, still allow mode switching but don't control motors
     if not motor_control_enabled:
@@ -567,15 +577,19 @@ def handle_detections(detections, frame):
             if in_detection_mode:
                 vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Keep motors at neutral
                 
-                # Show status message
-                cv2.putText(frame, "PAUSE COMPLETE - AWAITING MODE SWITCH", (frame.shape[1]//2 - 220, frame.shape[0]//2),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+                # Show status message (moved to bottom)
+                text = "PAUSE COMPLETE - AWAITING MODE SWITCH"
+                textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
                 print("Continuing to hold position until 10s detection countdown completes")
             else:
-                # If not in detection mode (unusual case), resume motion
-                cv2.putText(frame, "MOTION RESUMED", (frame.shape[1]//2 - 120, frame.shape[0]//2),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                # If not in detection mode (unusual case), resume motion (moved to bottom)
+                text = "MOTION RESUMED"
+                textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 print("Resumed motion after pause")
         else:
             # Motors still paused - show countdown
@@ -590,19 +604,23 @@ def handle_detections(detections, frame):
             if int(elapsed_time) % 1 == 0:  # Log once per second
                 print(f"Motors paused: {elapsed_time:.1f}s of {motor_run_time}s")
             
-            # Display motor status
-            cv2.putText(frame, "MOTORS PAUSED", (frame.shape[1]//2 - 120, frame.shape[0]//2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            # Display motor status (centered)
+            text = "MOTORS PAUSED"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Show motor values on screen
+            # Show motor values on screen (centered)
             motor_text = f"R:1335 L:1500"
-            cv2.putText(frame, motor_text, (frame.shape[1]//2 - 80, frame.shape[0]//2 + 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            textsize = cv2.getTextSize(motor_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, motor_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Show remaining time for motors to run
+            # Show remaining time for motors to run (centered)
             time_text = f"Paused: {remaining_time:.1f}s remaining"
-            cv2.putText(frame, time_text, (frame.shape[1]//2 - 120, frame.shape[0]//2 + 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            textsize = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, time_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
         return  # Skip all other detection while motors are active
     
@@ -611,8 +629,9 @@ def handle_detections(detections, frame):
         # In cooldown period
         cooldown_time = detection_cooldown - (current_time - last_detection_time)
         cooldown_text = f"Cooldown: {cooldown_time:.1f}s"
-        cv2.putText(frame, cooldown_text, (frame.shape[1]//2 - 100, frame.shape[0]//2 - 40),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        textsize = cv2.getTextSize(cooldown_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.putText(frame, cooldown_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         return  # Skip detection during cooldown
     
     # STAGE 3: DETECTION - Check for objects to activate motors
@@ -643,19 +662,23 @@ def handle_detections(detections, frame):
             print(f"Motors stopped for {motor_run_time} seconds")
             print(f"Current mode: {vehicle.mode.name}")
             
-            # Display activation message
-            cv2.putText(frame, "MOTORS STOPPED!", (frame.shape[1]//2 - 120, frame.shape[0]//2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            # Display activation message (centered)
+            text = "MOTORS STOPPED!"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Show motor values
+            # Show motor values (centered)
             motor_text = f"R:1335 L:1500"
-            cv2.putText(frame, motor_text, (frame.shape[1]//2 - 80, frame.shape[0]//2 + 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            textsize = cv2.getTextSize(motor_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, motor_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Show full run time at start
+            # Show full run time at start (centered)
             time_text = f"Paused: {motor_run_time:.1f}s remaining"
-            cv2.putText(frame, time_text, (frame.shape[1]//2 - 120, frame.shape[0]//2 + 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            textsize = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, time_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
 def process_frame(frame):
     """Run detection and annotate frame."""
@@ -1078,10 +1101,11 @@ while True:
         status = "ENABLED" if motor_control_enabled else "DISABLED"
         print(f"\nMotor pause on detection {status}")
         
-        # Display temporary message on screen
+        # Display temporary message on screen (centered)
         temp_frame = frame.copy()
         message = f"Motor Pause: {status}"
-        cv2.putText(temp_frame, message, (resW//4, resH//2), 
+        textsize = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
+        cv2.putText(temp_frame, message, (resW//2 - textsize[0]//2, resH//2), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, 
                    (0,0,255) if motor_control_enabled else (0,255,0), 3)
         
