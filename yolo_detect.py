@@ -138,6 +138,15 @@ def connect_pixhawk(connection_string='/dev/ttyAMA0', baud_rate=57600, timeout=3
         print(f" > Mode: {vehicle.mode.name}")
         print(f" > GPS: {vehicle.gps_0.fix_type}")
         print(f" > Battery: {vehicle.battery.voltage}V")
+        
+        # Ensure all motor outputs are at correct neutral position upon connection
+        print("Setting all motors to neutral position...")
+        # Clear any existing RC overrides
+        vehicle.channels.overrides = {}
+        # Explicitly set motor channels to their specific neutral positions
+        vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
+        vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+        
         return True
     except APIException as e:
         print(f"Connection timed out: {e}")
@@ -254,6 +263,11 @@ def arm_disarm(arm_command):
             for _ in range(10):  # Try for a few seconds
                 if vehicle.armed:
                     print("Vehicle armed!")
+                    # Immediately set all motors to their specific neutral positions
+                    print("Setting all motors to neutral position...")
+                    # Set motor channels directly to their specific neutral positions
+                    vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
+                    vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
                     return True
                 time.sleep(0.5)
             
@@ -304,6 +318,91 @@ def takeoff(target_altitude):
     except Exception as e:
         print(f"Error during takeoff: {e}")
         return False
+        
+def clear_all_motor_overrides():
+    """
+    Clear all RC overrides, returning control to RC transmitter or stopping motors.
+    This is a safety function to ensure motors don't keep running.
+    
+    Returns:
+        Success status (bool)
+    """
+    global vehicle
+    if vehicle is None:
+        print("ERROR: Cannot clear overrides - no active connection to Pixhawk")
+        return False
+    
+    try:
+        # Clear all channel overrides
+        vehicle.channels.overrides = {}
+        print("All RC channel overrides cleared")
+        return True
+    except Exception as e:
+        print(f"Error clearing RC overrides: {e}")
+        return False
+
+def control_motors(right_motor_value=None, left_motor_value=None, should_clear=False):
+    """
+    Control the motors connected to Pixhawk outputs 1 (right) and 3 (left).
+    
+    Args:
+        right_motor_value: PWM value for the right motor (channel 1), 1000-2000
+                          1000 = off, 1500 = mid, 2000 = full throttle
+                          If None, this motor is not changed
+        left_motor_value: PWM value for the left motor (channel 3), 1000-2000
+                         1000 = off, 1500 = mid, 2000 = full throttle
+                         If None, this motor is not changed
+        should_clear: Whether to clear all overrides after setting values.
+                     Only use this when you want to remove all overrides.
+                         
+    Returns:
+        Success status (bool)
+    """
+    global vehicle, motor_control_enabled
+    if vehicle is None:
+        print("ERROR: Cannot control motors - no active connection to Pixhawk")
+        return False
+    
+    # Only perform the safety check if motor control is disabled
+    # or if we're doing explicit motor tests (keyboard test)
+    if not motor_control_enabled:
+        # Allow explicit testing through keyboard commands
+        caller = sys._getframe(1).f_code.co_name
+        is_keyboard_test = caller == "<module>"
+        
+        # If not an explicit test and trying to set motors above minimum
+        if not is_keyboard_test and (
+            (right_motor_value is not None and right_motor_value > 1000) or 
+            (left_motor_value is not None and left_motor_value > 1000)):
+            print("WARNING: Attempt to set motors above minimum while motor control is disabled")
+            print("Overriding to minimum throttle for safety")
+            right_motor_value = 1000 if right_motor_value is not None else None
+            left_motor_value = 1000 if left_motor_value is not None else None
+    
+    try:
+        # Validate and apply right motor value (channel 1)
+        if right_motor_value is not None:
+            # Ensure value is within valid PWM range
+            right_motor_value = max(1000, min(2000, right_motor_value))
+            vehicle.channels.overrides['1'] = right_motor_value
+            print(f"Right motor (channel 1) set to {right_motor_value}")
+            
+        # Validate and apply left motor value (channel 3)
+        if left_motor_value is not None:
+            # Ensure value is within valid PWM range
+            left_motor_value = max(1000, min(2000, left_motor_value))
+            vehicle.channels.overrides['3'] = left_motor_value
+            print(f"Left motor (channel 3) set to {left_motor_value}")
+            
+        # Only clear all overrides if explicitly requested
+        if should_clear:
+            print("Clearing all RC channel overrides")
+            vehicle.channels.overrides = {}
+            
+        return True
+    except Exception as e:
+        print(f"Error controlling motors: {e}")
+        return False
 
 def show_command_help():
     """Display available commands for the Pixhawk."""
@@ -327,10 +426,272 @@ def show_command_help():
 # Detection and Frame Processing
 # ---------------------------
 
+# Global flags to enable/disable motor control based on detections
+motor_control_enabled = False
+motor_active = False  # Flag to track if motors are currently active
+last_detection_time = 0
+motor_run_time = 5.0  # How long to run motors after detection (seconds)
+detection_cooldown = 3.0  # Minimum time between motor activations (seconds)
+# Additional flag to simplify motor control logic
+motor_start_time = 0  # Time when motors were activated
+
+# Mode switching control
+mode_switch_on_detection = True  # Flag to enable automatic mode switching on detection (always on)
+original_mode = None  # Store original mode to switch back if needed
+mode_switch_time = 0  # When we switched modes
+mode_switch_duration = 10.0  # How long to stay in GUIDED mode after last detection (seconds)
+in_detection_mode = False  # Flag to indicate we're in detection handling mode
+last_detection_confirmed_time = time.time()  # Initialize with current time to prevent errors
+
+def handle_detections(detections, frame):
+    """
+    Handle motor control and mode switching based on detected objects.
+    
+    Args:
+        detections: List of object detections
+        frame: The current video frame
+    """
+    global vehicle, motor_control_enabled, last_detection_time, motor_active, motor_start_time
+    global mode_switch_on_detection, original_mode, mode_switch_time, in_detection_mode
+    
+    # If vehicle isn't connected, do nothing
+    if vehicle is None or not vehicle.armed:
+        return
+    
+    # Get current time
+    current_time = time.time()
+    
+    # Handle mode switching automatically based on detections
+    # This always runs because mode_switch_on_detection is always True
+    
+    # First check for detections to determine if we should enter GUIDED mode
+    has_detections = False
+    for detection in detections:
+        conf = detection.conf.item()
+        if conf > min_thresh:
+            has_detections = True
+            # Update time of last detection - need to use global keyword
+            global last_detection_confirmed_time
+            last_detection_confirmed_time = current_time
+            break
+    
+    current_mode = vehicle.mode.name
+    
+    # If we have detections and we're not already in MANUAL mode, switch to MANUAL
+    if has_detections and current_mode == 'AUTO' and not in_detection_mode:
+        # Store the original mode so we can switch back later
+        original_mode = current_mode
+        
+        print(f"\nDetection triggered auto mode switch! Current mode: {current_mode}")
+        print(f"Switching to MANUAL mode for object handling")
+        
+        # Switch to MANUAL mode
+        try:
+            vehicle.mode = VehicleMode('MANUAL')
+            in_detection_mode = True
+            mode_switch_time = current_time
+            
+            # Safety first - stop the vehicle by setting motors to neutral
+            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
+            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+            
+            # Show mode switch notification (centered)
+            text = f"SWITCHING MODES: {current_mode} → MANUAL"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, 
+                      (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 30),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        except Exception as e:
+            print(f"Error switching mode: {e}")
+    
+    # If we're in detection mode, show status and check for switching back
+    if in_detection_mode:
+        # If we have no detections for the duration period, switch back to original mode
+        time_since_last_detection = current_time - last_detection_confirmed_time
+        if time_since_last_detection >= mode_switch_duration:
+            # Switch back to original mode
+            if original_mode is not None:
+                print(f"\nNo detections for {mode_switch_duration} seconds.")
+                print(f"Switching back to {original_mode} mode")
+                try:
+                    vehicle.mode = VehicleMode(original_mode)
+                    in_detection_mode = False
+                    original_mode = None
+                    
+                    # Now that we're switching back to AUTO mode, display a clear message
+                    print("Mode switch complete - Resuming motion in AUTO mode")
+                    
+                    # Make sure we're not setting overrides anymore
+                    # This allows the AUTO mode to take full control
+                    vehicle.channels.overrides = {}
+                    
+                    # Draw a message indicating motion is resuming (moved to bottom)
+                    text = "RETURNING TO AUTO - RESUMING MOTION"
+                    textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    cv2.putText(frame, text, 
+                              (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                except Exception as e:
+                    print(f"Error switching back to original mode: {e}")
+        
+        # Show mode information on screen (centered)
+        text = f"DETECTION MODE: MANUAL"
+        textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        if has_detections:
+            text = f"Object detected - holding in MANUAL mode"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, 
+                       (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            remaining_time = mode_switch_duration - time_since_last_detection
+            text = f"No detections - returning to {original_mode} in: {remaining_time:.1f}s"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, 
+                       (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
+    # If motor control is disabled, still allow mode switching but don't control motors
+    if not motor_control_enabled:
+        return
+    
+    # Get current time
+    current_time = time.time()
+    
+    # STAGE 1: MOTORS ACTIVE - Motors are currently paused
+    if motor_active:
+        # Check if the full pause time has elapsed
+        elapsed_time = current_time - motor_start_time
+        if elapsed_time >= motor_run_time:
+            # Motor pause time complete - mark pause as complete but keep motors neutral
+            print("\nPause time complete (5s). Staying in MANUAL mode until countdown completes.")
+            
+            # Record stop time and state but keep motors at neutral until mode switch completes
+            motor_active = False
+            last_detection_time = current_time  # Start cooldown period
+            
+            # Continue enforcing neutral position while in detection mode
+            if in_detection_mode:
+                vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Keep motors at neutral
+                
+                # Show status message (moved to bottom)
+                text = "PAUSE COMPLETE - AWAITING MODE SWITCH"
+                textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                print("Continuing to hold position until 10s detection countdown completes")
+            else:
+                # If not in detection mode (unusual case), resume motion (moved to bottom)
+                text = "MOTION RESUMED"
+                textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                print("Resumed motion after pause")
+        else:
+            # Motors still paused - show countdown
+            remaining_time = motor_run_time - elapsed_time
+            
+            # SIMPLIFIED APPROACH: Keep motors at neutral
+            # No checks, no diagnostics that might interfere
+            # Simply enforce neutral position throughout the entire 5-second duration
+            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment
+            
+            # Only log status once per second without any checks or modifications
+            if int(elapsed_time) % 1 == 0:  # Log once per second
+                print(f"Motors paused: {elapsed_time:.1f}s of {motor_run_time}s")
+            
+            # Display motor status (centered)
+            text = "MOTORS PAUSED"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Show motor values on screen (centered)
+            motor_text = f"R:1335 L:1500"
+            textsize = cv2.getTextSize(motor_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, motor_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Show remaining time for motors to run (centered)
+            time_text = f"Paused: {remaining_time:.1f}s remaining"
+            textsize = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, time_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+        return  # Skip all other detection while motors are active
+    
+    # STAGE 2: COOLDOWN - Wait cooldown period after motors stop
+    if current_time - last_detection_time <= detection_cooldown:
+        # In cooldown period
+        cooldown_time = detection_cooldown - (current_time - last_detection_time)
+        cooldown_text = f"Cooldown: {cooldown_time:.1f}s"
+        textsize = cv2.getTextSize(cooldown_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.putText(frame, cooldown_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        return  # Skip detection during cooldown
+    
+    # STAGE 3: DETECTION - Check for objects to activate motors
+    # Check if we have any high-confidence detections
+    has_detections = False
+    for detection in detections:
+        conf = detection.conf.item()
+        if conf > min_thresh:  # Use confidence threshold from config
+            has_detections = True
+            break
+    
+    # If we have detections, stop motors instead of activating them
+    if has_detections:
+        print("\nObject detected!")
+        
+        # If motor control is enabled, stop motors for the pause duration
+        if motor_control_enabled:
+            print("\nSTOPPING MOTORS FOR 5 SECONDS")
+            
+            # SIMPLIFIED APPROACH: Just set motors to neutral directly
+            # No checks, no diagnostics that might interfere
+            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment to neutral positions
+            
+            # Record start time and activate flag immediately
+            motor_start_time = current_time
+            motor_active = True
+            
+            print(f"Motors stopped for {motor_run_time} seconds")
+            print(f"Current mode: {vehicle.mode.name}")
+            
+            # Display activation message (centered)
+            text = "MOTORS STOPPED!"
+            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Show motor values (centered)
+            motor_text = f"R:1335 L:1500"
+            textsize = cv2.getTextSize(motor_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, motor_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Show full run time at start (centered)
+            time_text = f"Paused: {motor_run_time:.1f}s remaining"
+            textsize = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(frame, time_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
 def process_frame(frame):
     """Run detection and annotate frame."""
+    global last_detection_time, motor_run_time, motor_active
     results = model(frame, verbose=False)
     detections = results[0].boxes
+    
+    # Handle detections for motor control
+    handle_detections(detections, frame)
+    
+    # We don't need the extra safety check here anymore as the handle_detections 
+    # function handles the motor timing correctly
+    
     object_count = 0
     most_centered_idx = None
     min_center_dist = None
@@ -375,7 +736,7 @@ def process_frame(frame):
             center_y = (ymin + ymax) // 2
             centers.append((center_x, center_y))
 
-            # Calculate distance to frame center
+                    # Calculate distance to frame center
             dist = np.hypot(center_x - frame_center[0], center_y - frame_center[1])
             if min_center_dist is None or dist < min_center_dist:
                 min_center_dist = dist
@@ -386,6 +747,30 @@ def process_frame(frame):
         cx, cy = centers[most_centered_idx]
         cv2.drawMarker(frame, (cx, cy), (0,255,0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
         cv2.putText(frame, 'MOST CENTERED', (cx-60, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+    
+    # Simplified safety check
+    # Only run if motors are NOT active to avoid interference with active motor control
+    current_time = time.time()  # Get current time for safety check
+    if vehicle is not None and vehicle.armed and not motor_active:
+        # Only check every 5 seconds to avoid flooding console
+        if int(current_time) % 5 == 0:
+            try:
+                # Only check when motors should be idle (not in active motor control period)
+                if not motor_control_enabled:
+                    right_motor = vehicle.channels['1']
+                    left_motor = vehicle.channels['3']
+                    
+                    # Check if motors are significantly off from their specific neutral positions
+                    if abs(right_motor - 1335) > 50 or abs(left_motor - 1500) > 50:
+                        print(f"\nSAFETY CHECK: Motors off neutral when they should be idle!")
+                        print(f"Values: Right={right_motor}, Left={left_motor}")
+                        print("Setting motors to neutral positions...")
+                        
+                        # Set motors to neutral with direct dictionary assignment
+                        vehicle.channels.overrides = {'1': 1335, '3': 1500}
+            except Exception as e:
+                print(f"Safety check error: {e}")
+        
     return frame, object_count
 
 # ---------------------------
@@ -400,6 +785,10 @@ print("  'p': Save screenshot")
 print("  'c': Reconnect to Pixhawk (if disconnected)")
 print("  'd': Run diagnostic port scan")
 print("  'h': Show Pixhawk command help")
+print("  'e': Enable/disable motor pause on detection")
+print("  'r': Test right motor (channel 1)")
+print("  'l': Test left motor (channel 3)")
+# Mode switching is now automatic
 
 avg_frame_rate = 0
 frame_rate_buffer = []
@@ -407,6 +796,10 @@ fps_avg_len = 30
 
 # Initialize Pixhawk connection variable
 vehicle = None
+
+# Initialize a flag to track if we've already forced motors off 
+# (to avoid multiple redundant messages)
+motors_forced_off = False
 
 # Automatically connect to Pixhawk on startup
 if DRONEKIT_AVAILABLE:
@@ -479,6 +872,8 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
     cv2.putText(frame, f'Objects: {object_count}', (10,60), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+    cv2.putText(frame, f'Confidence: {int(min_thresh*100)}%', (10,90), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
     
     # Display Pixhawk connection status if applicable
     if DRONEKIT_AVAILABLE:
@@ -488,8 +883,50 @@ while True:
         else:
             connection_status = "Not connected (Press 'c' to connect)"
             color = (0,0,255)  # Red
-        cv2.putText(frame, f'Pixhawk: {connection_status}', (10,90), 
+        cv2.putText(frame, f'Pixhawk: {connection_status}', (10,120), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    
+    # Display motor pause status
+    motor_status = "ENABLED" if motor_control_enabled else "DISABLED"
+    motor_color = (0,0,255) if motor_control_enabled else (0,255,0)  # Red if enabled, green if disabled
+    cv2.putText(frame, f'Motor Pause: {motor_status}', (10,150),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, motor_color, 2)
+                
+    # Display mode switching status (always enabled)
+    cv2.putText(frame, f'Auto Mode Switch: ENABLED', (10,180),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)  # Always red since it's always on
+                
+    # Display armed status
+    if vehicle is not None:
+        if vehicle.armed:
+            cv2.putText(frame, f'ARMED', (10,210),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)  # Red for armed
+            
+            # Check if motors are running when they shouldn't be
+            try:
+                right_motor = vehicle.channels['1'] 
+                left_motor = vehicle.channels['3']
+                
+                # Check if motors are significantly off from their specific neutral positions
+                if (abs(right_motor - 1335) > 50 or abs(left_motor - 1500) > 50) and not motor_control_enabled:
+                    # Display warning about unexpected motor activation
+                    warning = "WARNING: MOTORS ACTIVE!"
+                    cv2.putText(frame, warning, (resW//2 - 150, 40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)  # Red warning
+                    
+                    # Show motor values
+                    motor_text = f"R:{right_motor} L:{left_motor}"
+                    cv2.putText(frame, motor_text, (resW//2 - 80, 80),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+            except:
+                pass  # Skip if can't read channels
+        else:
+            cv2.putText(frame, f'DISARMED', (10,210),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)  # Green for disarmed
+        
+        # Display current flight mode
+        cv2.putText(frame, f'Mode: {vehicle.mode.name}', (10,240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)  # Yellow for mode
     frame_center = (resW // 2, resH // 2)
     cv2.line(frame, (frame_center[0], 0), (frame_center[0], resH), (0, 255, 255), 2)
     cv2.line(frame, (0, frame_center[1]), (resW, frame_center[1]), (0, 255, 255), 2)
@@ -554,6 +991,8 @@ while True:
             available_modes = ['STABILIZE', 'ALT_HOLD', 'LOITER', 'GUIDED', 'AUTO', 'RTL', 'LAND']
             print("\nAvailable flight modes:", ", ".join(available_modes))
             print("Current mode:", vehicle.mode.name)
+            print("NOTE: Mode switching is now automatic based on detections")
+            print("Current mode:", vehicle.mode.name)
             print("Enter first letter of mode or full mode name (e.g., 's' or 'STABILIZE')")
             cv2.putText(frame, "Enter mode in terminal", (resW//3, resH//2), 
                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
@@ -579,7 +1018,12 @@ while True:
     elif key == ord('a'):
         # Arm motors
         if vehicle:
-            arm_disarm(True)
+            if arm_disarm(True):
+                # After successful arming, explicitly ensure motors are at their specific neutral positions
+                print("Setting all motors to neutral position after arming...")
+                # Set motor channels directly to their specific neutral positions
+                vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
+                vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
         else:
             print("Pixhawk not connected! Connect first.")
     elif key == ord('f'):
@@ -598,13 +1042,92 @@ while True:
         else:
             print("Pixhawk not connected! Connect first.")
     elif key == ord('l'):
-        # Land
+        # Land the vehicle
         if vehicle:
-            set_flight_mode('LAND')
+            try:
+                print("\nAttempting to switch to LAND mode...")
+                vehicle.mode = VehicleMode("LAND")
+                time.sleep(0.5)
+                print(f"Current mode: {vehicle.mode.name}")
+            except Exception as e:
+                print(f"Error changing to LAND mode: {e}")
         else:
-            print("Pixhawk not connected! Connect first.")
+            print("No connection to vehicle. Cannot land.")# Either Land mode or test left motor depending on modifier key
+        if cv2.getWindowProperty('YOLO Detection', cv2.WND_PROP_VISIBLE) < 1:
+            # Window not in focus, assume terminal is - this is for Land mode
+            if vehicle:
+                set_flight_mode('LAND')
+            else:
+                print("Pixhawk not connected! Connect first.")
+        else:
+            # Window in focus - test left motor (channel 3)
+            if vehicle and vehicle.armed:
+                print("\nTesting left motor (channel 3)...")
+                print("Setting to maximum throttle (1894) for 5 seconds...")
+                # Set right motor explicitly to its neutral and left motor to test value
+                vehicle.channels.overrides['1'] = 1335  # Right motor specific neutral
+                vehicle.channels.overrides['3'] = 1894  # Left motor maximum power
+                
+                # Keep power for full 5 seconds
+                print("Left motor activated at 1894 for 5 seconds...")
+                time.sleep(5.0)
+                
+                # Return to neutral position
+                vehicle.channels.overrides['3'] = 1500  # Left motor specific neutral
+                print("Left motor test complete")
+            else:
+                print("Pixhawk not connected or not armed! Connect and arm first.")
+    elif key == ord('r'):
+        # Test right motor (channel 1)
+        if vehicle and vehicle.armed:
+            print("\nTesting right motor (channel 1)...")
+            print("Setting to maximum throttle (1894) for 5 seconds...")
+            # Set left motor explicitly to its neutral and right motor to test value
+            vehicle.channels.overrides['3'] = 1500  # Left motor neutral
+            vehicle.channels.overrides['1'] = 1894  # Right motor maximum power
+            
+            # Keep power for full 5 seconds
+            print("Right motor activated at 1894 for 5 seconds...")
+            time.sleep(5.0)
+            
+            # Return to neutral position
+            vehicle.channels.overrides['1'] = 1335  # Right motor specific neutral
+            print("Right motor test complete")
+        else:
+            print("Pixhawk not connected or not armed! Connect and arm first.")
+    elif key == ord('e'):
+        # Toggle detection-based motor pause
+        motor_control_enabled = not motor_control_enabled
+        status = "ENABLED" if motor_control_enabled else "DISABLED"
+        print(f"\nMotor pause on detection {status}")
+        
+        # Display temporary message on screen (centered)
+        temp_frame = frame.copy()
+        message = f"Motor Pause: {status}"
+        textsize = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
+        cv2.putText(temp_frame, message, (resW//2 - textsize[0]//2, resH//2), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, 
+                   (0,0,255) if motor_control_enabled else (0,255,0), 3)
+        
+    # No longer need to toggle mode switching as it's always enabled
+
+        # If we're disabling, make sure motors are at neutral
+        if not motor_control_enabled and vehicle and vehicle.armed:
+            print("Disabling motor control and setting motors to their specific neutral positions")
+            # Reset motor active flag
+            motor_active = False
+            # Set motors directly to their specific neutral positions
+            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
+            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
     elif key == ord('z'):
-        # Return to launch
+        # Return to Launch
+        if vehicle:
+            if set_flight_mode('RTL'):
+                print("Vehicle returning to launch point")
+            else:
+                print("Failed to enter RTL mode")
+        else:
+            print("Pixhawk not connected! Connect first.")# Return to launch
         if vehicle:
             set_flight_mode('RTL')
         else:
@@ -629,7 +1152,31 @@ if record:
     recorder.release()
 cv2.destroyAllWindows()
 
-# Close Pixhawk connection
+# Make sure motors are off and close Pixhawk connection
 if vehicle is not None:
+    # Safety: turn off all motor outputs with multiple approaches
+    try:
+        print("Turning off all motor outputs...")
+        
+        # Multiple methods to ensure motors are set to their specific neutral positions
+        # 1. Set individual channels to their specific neutral positions
+        control_motors(right_motor_value=1335, left_motor_value=1500)
+        
+        # 2. Clear all overrides
+        clear_all_motor_overrides()
+        
+        # 3. Set individual channels again to ensure correct neutral positions
+        vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
+        vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+        
+        # 4. Wait a moment and clear again
+        time.sleep(0.5)
+        vehicle.channels.overrides = {}
+        
+        print("Motor shutdown sequence complete")
+    except Exception as e:
+        print(f"Error during motor shutdown: {e}")
+        
+    # Close connection
     vehicle.close()
     print("Pixhawk connection closed.")
