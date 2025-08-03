@@ -2,6 +2,7 @@
 
 # Activate virtual environment
 source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
+source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
 
 # Change to project directory
 cd /home/pi/ebbtide-yolo-trashdetect

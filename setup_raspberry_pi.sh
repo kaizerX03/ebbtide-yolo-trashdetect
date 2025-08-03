@@ -14,6 +14,18 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
+# Check if filesystem is read-only and make it writable
+echo "🔧 Checking filesystem status..."
+if mount | grep -q "/ .*ro,"; then
+    echo "📝 Filesystem is read-only, making it temporarily writable..."
+    sudo mount -o remount,rw /
+    FILESYSTEM_WAS_READONLY=true
+    echo "✅ Filesystem is now writable"
+else
+    echo "✅ Filesystem is already writable"
+    FILESYSTEM_WAS_READONLY=false
+fi
+
 # Update system packages
 echo "📦 Updating system packages..."
 sudo apt update && sudo apt upgrade -y
@@ -148,6 +160,7 @@ cat > /home/pi/ebbtide-yolo-trashdetect/start_trash_collector.sh << 'EOF'
 
 # Activate virtual environment
 source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
+source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
 
 # Change to project directory
 cd /home/pi/ebbtide-yolo-trashdetect
@@ -276,6 +289,13 @@ chmod +x /home/pi/ebbtide-yolo-trashdetect/test_setup.py
 # Deactivate virtual environment
 deactivate
 
+# Restore read-only filesystem if it was originally read-only
+if [ "$FILESYSTEM_WAS_READONLY" = true ]; then
+    echo "🔒 Restoring read-only filesystem..."
+    sudo mount -o remount,ro /
+    echo "✅ Filesystem is now read-only again"
+fi
+
 echo ""
 echo "=================================================="
 echo "🎉 Setup Complete!"
@@ -283,8 +303,8 @@ echo "=================================================="
 echo ""
 echo "What was installed:"
 echo "✅ System packages (OpenCV, build tools, etc.)"
-echo "✅ Python virtual environment at /home/pi/yolo_env"
-echo "✅ Python packages (ultralytics, OpenCV, DroneKit, etc.)"
+echo "✅ Python virtual environment at /home/pi/ebbtide-yolo-trashdetect/ebb_env (with system site packages)"
+echo "✅ Python packages (ultralytics 8.3.7, PyTorch 2.5.1, OpenCV, DroneKit, etc.)"
 echo "✅ Pi Camera support"
 echo "✅ Serial port configuration for Pixhawk"
 echo "✅ Startup script: start_trash_collector.sh"
@@ -293,8 +313,13 @@ echo ""
 echo "Next steps:"
 echo "1. Reboot your Raspberry Pi: sudo reboot"
 echo "2. Test the installation: python3 test_setup.py"
-echo "3. Place your YOLO model at: /home/pi/yolo_env/ebb_ncnn_model"
+echo "3. Place your YOLO model at: /home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model"
 echo "4. Run the project: ./start_trash_collector.sh"
 echo ""
+if [ "$FILESYSTEM_WAS_READONLY" = true ]; then
+    echo "🔒 FILESYSTEM PROTECTION: Your system has been restored to read-only mode"
+    echo "   This protects against corruption and unauthorized changes."
+    echo ""
+fi
 echo "⚠️  IMPORTANT: You need to reboot for all changes to take effect!"
 echo ""
