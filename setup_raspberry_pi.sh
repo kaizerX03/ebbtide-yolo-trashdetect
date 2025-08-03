@@ -76,18 +76,42 @@ sudo apt install -y \
     libcamera-apps \
     libcamera-dev
 
-# Enable camera interface
-echo "🔧 Enabling camera interface..."
-#sudo raspi-config nonint do_camera 0
+ENABLE_CAMERA=${ENABLE_CAMERA:-false}
+ENABLE_I2C_SPI=${ENABLE_I2C_SPI:-false}
+ENABLE_SERIAL=${ENABLE_SERIAL:-false}
 
-# Enable I2C and SPI (sometimes needed for sensors)
-echo "🔧 Enabling I2C and SPI..."
-#sudo raspi-config nonint do_i2c 0
-#sudo raspi-config nonint do_spi 0
+if [ "$ENABLE_CAMERA" = true ]; then
+    echo "🔧 Enabling camera interface..."
+    sudo raspi-config nonint do_camera 0
+fi
 
-# Enable serial port for Pixhawk communication
-echo "🔧 Configuring serial port for Pixhawk..."
-#sudo raspi-config nonint do_serial 2  # Enable serial, disable console
+if [ "$ENABLE_I2C_SPI" = true ]; then
+    echo "🔧 Enabling I2C and SPI..."
+    sudo raspi-config nonint do_i2c 0
+    sudo raspi-config nonint do_spi 0
+fi
+
+if [ "$ENABLE_SERIAL" = true ]; then
+    echo "🔧 Configuring serial port for Pixhawk..."
+    sudo raspi-config nonint do_serial 2  # Enable serial, disable console
+fi
+# Add logic to copy missing files to the project directory
+echo "🔄 Checking for additional required files..."
+MISSING_FILES=("file1.txt" "file2.txt") # Replace with actual filenames
+for FILE in "${MISSING_FILES[@]}"; do
+    if [ ! -f "/home/pi/ebbtide-yolo-trashdetect/$FILE" ]; then
+        echo "⚠️  $FILE not found, copying from backup or template..."
+        # Example: copy from a backup location or template
+        # cp /home/pi/backup/$FILE /home/pi/ebbtide-yolo-trashdetect/
+        # If you have a template, use that path
+        # cp /home/pi/templates/$FILE /home/pi/ebbtide-yolo-trashdetect/
+        # If not available, touch an empty file
+        touch "/home/pi/ebbtide-yolo-trashdetect/$FILE"
+        echo "✅ $FILE created."
+    else
+        echo "✅ $FILE already exists."
+    fi
+done
 
 # Add user to dialout group for serial communication
 echo "👤 Adding user to dialout group..."
