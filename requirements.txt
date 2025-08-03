@@ -22,8 +22,6 @@ picamera2
 
 # Drone/Flight controller communication
 dronekit>=2.9.0
-pymavlink>=2.4.0
-dronekit-sitl>=3.3.0
 
 # Additional utilities
 psutil>=5.8.0

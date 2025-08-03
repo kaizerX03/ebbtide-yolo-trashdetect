@@ -66,42 +66,51 @@ sudo apt install -y \
 
 # Enable camera interface
 echo "🔧 Enabling camera interface..."
-sudo raspi-config nonint do_camera 0
+#sudo raspi-config nonint do_camera 0
 
 # Enable I2C and SPI (sometimes needed for sensors)
 echo "🔧 Enabling I2C and SPI..."
-sudo raspi-config nonint do_i2c 0
-sudo raspi-config nonint do_spi 0
+#sudo raspi-config nonint do_i2c 0
+#sudo raspi-config nonint do_spi 0
 
 # Enable serial port for Pixhawk communication
 echo "🔧 Configuring serial port for Pixhawk..."
-sudo raspi-config nonint do_serial 2  # Enable serial, disable console
+#sudo raspi-config nonint do_serial 2  # Enable serial, disable console
 
 # Add user to dialout group for serial communication
 echo "👤 Adding user to dialout group..."
 sudo usermod -a -G dialout $USER
 
-# Create virtual environment directory if it doesn't exist
-VENV_DIR="/home/pi/yolo_env"
-echo "🐍 Creating Python virtual environment at $VENV_DIR..."
+VENV_DIR="/home/pi/ebbtide-yolo-trashdetect/ebb_env"
+echo "🐍 Creating Python virtual environment at $VENV_DIR with system site packages..."
 if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv $VENV_DIR
-    echo "✅ Virtual environment created at $VENV_DIR"
+    python3 -m venv --system-site-packages $VENV_DIR
+    echo "✅ Virtual environment created at $VENV_DIR (system site packages enabled)"
 else
     echo "✅ Virtual environment already exists at $VENV_DIR"
 fi
 
-# Activate virtual environment and install Python packages
-echo "📦 Installing Python packages in virtual environment..."
+
+# Activate virtual environment and prepare for package installation
+echo "📦 Activating Python virtual environment..."
 source $VENV_DIR/bin/activate
 
 # Upgrade pip
 pip install --upgrade pip
 
-# Install core dependencies
+# Uninstall all existing Python packages in the venv
+echo "🧹 Uninstalling all existing Python packages in the virtual environment..."
+pip freeze | xargs -r pip uninstall -y
+echo "✅ All existing Python packages uninstalled."
+
+
+# Install core dependencies with pinned versions
 echo "Installing core Python packages..."
 pip install \
-    ultralytics \
+    ultralytics==8.3.7 \
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    torchaudio==2.5.1 \
     opencv-python \
     opencv-contrib-python \
     numpy \
@@ -111,10 +120,6 @@ pip install \
     scipy \
     scikit-learn \
     pandas
-
-# Install PyTorch for ARM64 (if needed by ultralytics)
-echo "🔥 Installing PyTorch for ARM64..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # Install Picamera2 in virtual environment
 echo "📷 Installing Picamera2 in virtual environment..."
@@ -127,8 +132,7 @@ pip install \
     pymavlink \
     dronekit-sitl
 
-# Create model directory if it doesn't exist
-MODEL_DIR="/home/pi/yolo_env"
+MODEL_DIR="$VENV_DIR"
 echo "📁 Creating model directory at $MODEL_DIR..."
 mkdir -p $MODEL_DIR
 
@@ -138,20 +142,19 @@ sudo chmod 666 /dev/ttyAMA0 2>/dev/null || echo "ttyAMA0 not available"
 sudo chmod 666 /dev/ttyACM0 2>/dev/null || echo "ttyACM0 not available"
 sudo chmod 666 /dev/ttyUSB0 2>/dev/null || echo "ttyUSB0 not available"
 
-# Create startup script
 echo "🚀 Creating startup script..."
 cat > /home/pi/ebbtide-yolo-trashdetect/start_trash_collector.sh << 'EOF'
 #!/bin/bash
 
 # Activate virtual environment
-source /home/pi/yolo_env/bin/activate
+source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
 
 # Change to project directory
 cd /home/pi/ebbtide-yolo-trashdetect
 
 # Check if model exists
-if [ ! -f "/home/pi/yolo_env/ebb_ncnn_model" ]; then
-    echo "❌ YOLO model not found at /home/pi/yolo_env/ebb_ncnn_model"
+if [ ! -f "/home/pi/ebbtide-yolo-trashdetect/ebb_env/ebb_ncnn_model" ]; then
+    echo "❌ YOLO model not found at /home/pi/ebbtide-yolo-trashdetect/ebb_env/ebb_ncnn_model"
     echo "Please place your trained model file in the correct location"
     exit 1
 fi
@@ -163,7 +166,6 @@ EOF
 
 chmod +x /home/pi/ebbtide-yolo-trashdetect/start_trash_collector.sh
 
-# Create test script
 echo "🧪 Creating test script..."
 cat > /home/pi/ebbtide-yolo-trashdetect/test_setup.py << 'EOF'
 #!/usr/bin/env python3
@@ -252,7 +254,7 @@ def main():
     
     # Check model file
     print("\n🤖 Checking YOLO model...")
-    model_path = "/home/pi/yolo_env/ebb_ncnn_model"
+    model_path = "/home/pi/ebbtide-yolo-trashdetect/ebb_env/ebb_ncnn_model"
     if os.path.exists(model_path):
         print(f"✅ YOLO model found at {model_path}")
     else:
@@ -261,7 +263,7 @@ def main():
     
     print("\n🎉 Setup test complete!")
     print("\nNext steps:")
-    print("1. Place your YOLO model file at /home/pi/yolo_env/ebb_ncnn_model")
+    print("1. Place your YOLO model file at /home/pi/ebbtide-yolo-trashdetect/ebb_env/ebb_ncnn_model")
     print("2. Reboot your Raspberry Pi: sudo reboot")
     print("3. Run the detection script: ./start_trash_collector.sh")
 

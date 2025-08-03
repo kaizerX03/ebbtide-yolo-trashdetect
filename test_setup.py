@@ -5,6 +5,7 @@ Test script to verify all dependencies are properly installed
 
 import sys
 import importlib
+import os
 
 def test_import(module_name, description=""):
     try:
@@ -47,7 +48,7 @@ def test_serial():
     print("\n🔌 Testing serial port access...")
     import os
     
-    serial_devices = ['/dev/ttyAMA0', '/dev/ttyACM0', '/dev/ttyUSB0', '/dev/serial0']
+    serial_devices = ['/dev/ttyAMA0', '/dev/ttyUSB0', '/dev/serial0']
     for device in serial_devices:
         if os.path.exists(device):
             try:
@@ -84,7 +85,7 @@ def main():
     
     # Check model file
     print("\n🤖 Checking YOLO model...")
-    model_path = "/home/pi/yolo_env/ebb_ncnn_model"
+    model_path = "/home/pi/ebbtide-yolo-trashdetect/best_ncnn_model"
     if os.path.exists(model_path):
         print(f"✅ YOLO model found at {model_path}")
     else:
@@ -93,7 +94,7 @@ def main():
     
     print("\n🎉 Setup test complete!")
     print("\nNext steps:")
-    print("1. Place your YOLO model file at /home/pi/yolo_env/ebb_ncnn_model")
+    print("1. Place your YOLO model file at /home/pi/ebbtide-yolo-trashdetect/best_ncnn_model")
     print("2. Reboot your Raspberry Pi: sudo reboot")
     print("3. Run the detection script: ./start_trash_collector.sh")
 

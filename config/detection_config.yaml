@@ -1,7 +1,7 @@
 # YOLO Detection Configuration
 
 model:
-  path: "/home/pi/yolo_env/ebb_ncnn_model"  # You can change this to your custom model path
+  path: "/home/pi/ebbtide-yolo-trashdetect/best_ncnn_model"  # You can change this to your custom model path
   confidence_threshold: 0.4
 
 camera:

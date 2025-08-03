@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import yaml
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -64,7 +63,8 @@ if not os.path.exists(model_path):
 # ---------------------------
 
 model = YOLO(model_path, task='detect')
-labels = model.names
+labels = ['Human','NonTrash', 'Trash']  # Replace with your actual classes
+
 
 if 'usb' in img_source:
     source_type = 'usb'
