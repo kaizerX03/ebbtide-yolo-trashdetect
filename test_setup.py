@@ -84,7 +84,7 @@ def main():
     
     # Check model file
     print("\n🤖 Checking YOLO model...")
-    model_path = "/home/pi/yolo_env/ebb_ncnn_model"
+    model_path = "/home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model"
     if os.path.exists(model_path):
         print(f"✅ YOLO model found at {model_path}")
     else:
@@ -93,7 +93,7 @@ def main():
     
     print("\n🎉 Setup test complete!")
     print("\nNext steps:")
-    print("1. Place your YOLO model file at /home/pi/yolo_env/ebb_ncnn_model")
+    print("1. Place your YOLO model file at /home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model")
     print("2. Reboot your Raspberry Pi: sudo reboot")
     print("3. Run the detection script: ./start_trash_collector.sh")
 

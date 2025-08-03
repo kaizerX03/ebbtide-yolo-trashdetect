@@ -14,6 +14,18 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
+# Check if filesystem is read-only and make it writable
+echo "🔧 Checking filesystem status..."
+if mount | grep -q "/ .*ro,"; then
+    echo "📝 Filesystem is read-only, making it temporarily writable..."
+    sudo mount -o remount,rw /
+    FILESYSTEM_WAS_READONLY=true
+    echo "✅ Filesystem is now writable"
+else
+    echo "✅ Filesystem is already writable"
+    FILESYSTEM_WAS_READONLY=false
+fi
+
 # Update system packages
 echo "📦 Updating system packages..."
 sudo apt update && sudo apt upgrade -y
@@ -82,11 +94,11 @@ echo "👤 Adding user to dialout group..."
 sudo usermod -a -G dialout $USER
 
 # Create virtual environment directory if it doesn't exist
-VENV_DIR="/home/pi/yolo_env"
+VENV_DIR="/home/pi/ebbtide-yolo-trashdetect/ebb_env"
 echo "🐍 Creating Python virtual environment at $VENV_DIR..."
 if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv $VENV_DIR
-    echo "✅ Virtual environment created at $VENV_DIR"
+    python3 -m venv $VENV_DIR --system-site-packages
+    echo "✅ Virtual environment created at $VENV_DIR with system site packages"
 else
     echo "✅ Virtual environment already exists at $VENV_DIR"
 fi
@@ -98,10 +110,10 @@ source $VENV_DIR/bin/activate
 # Upgrade pip
 pip install --upgrade pip
 
-# Install core dependencies
-echo "Installing core Python packages..."
+# Install core dependencies with specific versions
+echo "Installing core Python packages with specific versions..."
 pip install \
-    ultralytics \
+    ultralytics==8.3.7 \
     opencv-python \
     opencv-contrib-python \
     numpy \
@@ -112,9 +124,13 @@ pip install \
     scikit-learn \
     pandas
 
-# Install PyTorch for ARM64 (if needed by ultralytics)
-echo "🔥 Installing PyTorch for ARM64..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Install PyTorch 2.5.1 for ARM64 with matching torchvision and torchaudio
+echo "🔥 Installing PyTorch 2.5.1 for ARM64..."
+pip install \
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cpu
 
 # Install Picamera2 in virtual environment
 echo "📷 Installing Picamera2 in virtual environment..."
@@ -128,7 +144,7 @@ pip install \
     dronekit-sitl
 
 # Create model directory if it doesn't exist
-MODEL_DIR="/home/pi/yolo_env"
+MODEL_DIR="/home/pi/ebbtide-yolo-trashdetect/best_ncnn_model"
 echo "📁 Creating model directory at $MODEL_DIR..."
 mkdir -p $MODEL_DIR
 
@@ -144,14 +160,14 @@ cat > /home/pi/ebbtide-yolo-trashdetect/start_trash_collector.sh << 'EOF'
 #!/bin/bash
 
 # Activate virtual environment
-source /home/pi/yolo_env/bin/activate
+source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
 
 # Change to project directory
 cd /home/pi/ebbtide-yolo-trashdetect
 
 # Check if model exists
-if [ ! -f "/home/pi/yolo_env/ebb_ncnn_model" ]; then
-    echo "❌ YOLO model not found at /home/pi/yolo_env/ebb_ncnn_model"
+if [ ! -f "/home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model" ]; then
+    echo "❌ YOLO model not found at /home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model"
     echo "Please place your trained model file in the correct location"
     exit 1
 fi
@@ -252,7 +268,7 @@ def main():
     
     # Check model file
     print("\n🤖 Checking YOLO model...")
-    model_path = "/home/pi/yolo_env/ebb_ncnn_model"
+    model_path = "/home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model"
     if os.path.exists(model_path):
         print(f"✅ YOLO model found at {model_path}")
     else:
@@ -261,7 +277,7 @@ def main():
     
     print("\n🎉 Setup test complete!")
     print("\nNext steps:")
-    print("1. Place your YOLO model file at /home/pi/yolo_env/ebb_ncnn_model")
+    print("1. Place your YOLO model file at /home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model")
     print("2. Reboot your Raspberry Pi: sudo reboot")
     print("3. Run the detection script: ./start_trash_collector.sh")
 
@@ -274,6 +290,13 @@ chmod +x /home/pi/ebbtide-yolo-trashdetect/test_setup.py
 # Deactivate virtual environment
 deactivate
 
+# Restore read-only filesystem if it was originally read-only
+if [ "$FILESYSTEM_WAS_READONLY" = true ]; then
+    echo "🔒 Restoring read-only filesystem..."
+    sudo mount -o remount,ro /
+    echo "✅ Filesystem is now read-only again"
+fi
+
 echo ""
 echo "=================================================="
 echo "🎉 Setup Complete!"
@@ -281,8 +304,8 @@ echo "=================================================="
 echo ""
 echo "What was installed:"
 echo "✅ System packages (OpenCV, build tools, etc.)"
-echo "✅ Python virtual environment at /home/pi/yolo_env"
-echo "✅ Python packages (ultralytics, OpenCV, DroneKit, etc.)"
+echo "✅ Python virtual environment at /home/pi/ebbtide-yolo-trashdetect/ebb_env (with system site packages)"
+echo "✅ Python packages (ultralytics 8.3.7, PyTorch 2.5.1, OpenCV, DroneKit, etc.)"
 echo "✅ Pi Camera support"
 echo "✅ Serial port configuration for Pixhawk"
 echo "✅ Startup script: start_trash_collector.sh"
@@ -291,8 +314,13 @@ echo ""
 echo "Next steps:"
 echo "1. Reboot your Raspberry Pi: sudo reboot"
 echo "2. Test the installation: python3 test_setup.py"
-echo "3. Place your YOLO model at: /home/pi/yolo_env/ebb_ncnn_model"
+echo "3. Place your YOLO model at: /home/pi/ebbtide-yolo-trashdetect/best_ncnn_model/ebb_ncnn_model"
 echo "4. Run the project: ./start_trash_collector.sh"
 echo ""
+if [ "$FILESYSTEM_WAS_READONLY" = true ]; then
+    echo "🔒 FILESYSTEM PROTECTION: Your system has been restored to read-only mode"
+    echo "   This protects against corruption and unauthorized changes."
+    echo ""
+fi
 echo "⚠️  IMPORTANT: You need to reboot for all changes to take effect!"
 echo ""
