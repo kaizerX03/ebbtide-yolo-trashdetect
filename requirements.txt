@@ -1,0 +1,29 @@
+# Core YOLO and Computer Vision
+ultralytics>=8.0.0
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+numpy>=1.21.0
+Pillow>=8.0.0
+
+# Data handling and configuration
+PyYAML>=6.0
+pandas>=1.3.0
+matplotlib>=3.3.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+
+# Deep Learning (PyTorch for ultralytics)
+torch>=1.12.0
+torchvision>=0.13.0
+torchaudio>=0.12.0
+
+# Camera support
+picamera2
+
+# Drone/Flight controller communication
+dronekit>=2.9.0
+pymavlink>=2.4.0
+dronekit-sitl>=3.3.0
+
+# Additional utilities
+psutil>=5.8.0
