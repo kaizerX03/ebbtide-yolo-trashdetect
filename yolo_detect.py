@@ -4,6 +4,9 @@ import time
 import yaml
 import cv2
 import numpy as np
+import logging
+import json
+from dataclasses import dataclass
 from ultralytics import YOLO
 
 # Make Picamera2 import optional
@@ -34,28 +37,109 @@ except Exception as e:
 # Configuration and Setup
 # ---------------------------
 
+"""YOLO trash detection script (config-driven, no CLI args)."""
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger("yolo_detect")
+
 def load_config():
-    """Load YAML configuration file."""
-    config_path = os.path.join(os.path.dirname(__file__), 'config', 'detection_config.yaml')
+    path = os.path.join(os.path.dirname(__file__), 'config', 'detection_config.yaml')
     try:
-        with open(config_path, 'r') as f:
+        with open(path, 'r') as f:
             return yaml.safe_load(f)
     except Exception as e:
-        print(f'ERROR: Could not load configuration file: {e}')
+        log.error(f'Could not load configuration file: {e}')
         sys.exit(1)
 
 config = load_config()
 model_path = config['model']['path']
 img_source = config['camera']['source']
 min_thresh = float(config['model']['confidence_threshold'])
-resW, resH = map(int, config['camera']['resolution'].split('x'))
-record = config['recording']['enabled']
+try:
+    resW, resH = map(int, config['camera']['resolution'].split('x'))
+except ValueError:
+    log.error("Invalid resolution format in config (expected WxH)")
+    sys.exit(1)
+record = bool(config.get('recording', {}).get('enabled', False))
 distance_estimation_config = config.get('distance_estimation', {})
 focal_length_px = distance_estimation_config.get('focal_length_px')
 known_object_height_mm = distance_estimation_config.get('known_object_height_mm')
+detection_required_frames = int(config.get('detection_logic', {}).get('consecutive_frames', 2))
+enable_mode_switch = bool(config.get('detection_logic', {}).get('enable_mode_switch', True))
+detection_consecutive_frames = 0
+pixhawk_settings = config.get('pixhawk', {})
+pixhawk_connection = pixhawk_settings.get('connection', '/dev/ttyAMA0')
+pixhawk_baud = int(pixhawk_settings.get('baud_rate', 57600))
+pixhawk_enabled = bool(pixhawk_settings.get('control_enabled', False))
+
+# Navigation (hybrid diversion) configuration
+nav_cfg = config.get('navigation', {})
+nav_mode = nav_cfg.get('mode', 'direct_control')
+forward_thrust_pwm = int(nav_cfg.get('forward_thrust_pwm', 1600))
+turn_gain_pwm = int(nav_cfg.get('turn_gain_pwm', 200))
+collection_distance_m = float(nav_cfg.get('collection_distance_m', 1.0))
+lost_target_timeout_s = float(nav_cfg.get('lost_target_timeout_s', 3.0))
+max_approach_time_s = float(nav_cfg.get('max_approach_time_s', 30.0))
+distance_filter_alpha = float(nav_cfg.get('distance_filter_alpha', 0.3))
+camera_fov_deg = float(nav_cfg.get('camera_fov_deg', 60.0))
+arrival_bbox_min_px = int(nav_cfg.get('arrival_bbox_min_px', 120))
+nav_logging_enabled = bool(nav_cfg.get('logging_enabled', True))
+nav_log_file = nav_cfg.get('log_file', 'nav_events.log')
+suppression_timeout_s = float(nav_cfg.get('suppression_timeout_s', 90.0))
+align_hold = bool(nav_cfg.get('align_hold', False))
+idle_brake_s = float(nav_cfg.get('idle_brake_s', 0.5))
+
+# Test mode flags
+test_mode_cfg = config.get('test_mode', {})
+simulate_navigation = bool(test_mode_cfg.get('simulate_navigation', False))
+
+@dataclass
+class ApproachState:
+    active: bool = False
+    start_time: float = 0.0
+    last_seen_time: float = 0.0
+    phase: str = 'idle'  # idle | align | advance | collect | abort
+    smoothed_distance_m: float = None
+    target_bearing: float = None
+    center_x: int = None
+    center_y: int = None
+    center_error: float = None  # normalized horizontal error [-1..1]
+    bbox_height_px: int = None
+    last_distance_m: float = None
+    last_thrust_log_time: float = 0.0
+    completed: bool = False
+
+approach_state = ApproachState()
+
+# Post-arrival detection suppression state
+detection_suppressed = False
+suppression_target_index = None
+suppression_start_time = 0.0
+
+def log_nav_event(event_type, **fields):
+    if not nav_logging_enabled:
+        return
+    payload = {
+        'ts': time.time(),
+        'event': event_type,
+        'phase': approach_state.phase,
+        'center_error': approach_state.center_error,
+        'distance_m': approach_state.last_distance_m,
+        'bbox_height_px': approach_state.bbox_height_px,
+        **fields
+    }
+    try:
+        with open(nav_log_file, 'a') as f:
+            f.write(json.dumps(payload) + '\n')
+    except Exception as e:
+        print(f"[NAV][LOG] Failed to write log: {e}")
 
 if not os.path.exists(model_path):
-    print('ERROR: Model path is invalid or model was not found.')
+    log.error('Model path is invalid or model was not found.')
     sys.exit(0)
 
 # ---------------------------
@@ -101,6 +185,17 @@ bbox_colors = [(164,120,87), (68,148,228), (93,97,209), (178,182,133), (88,159,1
 # Pixhawk Integration
 # ---------------------------
 vehicle = None
+
+def set_neutral_motors():
+    """Set motors to calibrated neutral values (safety helper)."""
+    global vehicle
+    if vehicle is None:
+        return
+    try:
+        vehicle.channels.overrides['1'] = 1335
+        vehicle.channels.overrides['3'] = 1500
+    except Exception as e:
+        log.warning(f"Neutral motor set failed: {e}")
 
 def connect_pixhawk(connection_string='/dev/ttyAMA0', baud_rate=57600, timeout=30):
     """Establish a connection to the Pixhawk via UART. Default is ttyAMA0 which is the standard UART port."""
@@ -265,9 +360,7 @@ def arm_disarm(arm_command):
                     print("Vehicle armed!")
                     # Immediately set all motors to their specific neutral positions
                     print("Setting all motors to neutral position...")
-                    # Set motor channels directly to their specific neutral positions
-                    vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-                    vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+                    set_neutral_motors()
                     return True
                 time.sleep(0.5)
             
@@ -412,7 +505,11 @@ def show_command_help():
     print("  'f': Disarm motors")
     print("  'h': Show this help menu")
     print("  't': Takeoff (to 2m altitude)")
-    print("  'l': Land")
+    # NOTE: 'LAND' is an ArduCopter flight mode and not supported on ArduRover (boat) firmware.
+    # The 'l' key is repurposed for a LEFT MOTOR test only.
+    print("  'l': Left motor test (channel 3)")
+    print("  'r': Right motor test (channel 1)")
+    print("  'e': Toggle auto navigation thrust (detection diversion ON/OFF)")
     print("  'z': Return to Launch (RTL)")
     print("------------------------")
     print("Current keyboard controls:")
@@ -453,6 +550,8 @@ def handle_detections(detections, frame):
     """
     global vehicle, motor_control_enabled, last_detection_time, motor_active, motor_start_time
     global mode_switch_on_detection, original_mode, mode_switch_time, in_detection_mode
+    # Suppression state globals (needed because we assign to them below)
+    global detection_suppressed, suppression_target_index, suppression_start_time
     
     # If vehicle isn't connected, do nothing
     if vehicle is None or not vehicle.armed:
@@ -460,20 +559,92 @@ def handle_detections(detections, frame):
     
     # Get current time
     current_time = time.time()
+
+    # Post-arrival suppression: ignore detections until next waypoint index advances or timeout
+    if detection_suppressed:
+        # Draw suppression overlay
+        sup_text = "SUPPRESSING DETECTIONS - RETURNING TO MISSION"
+        ts_sup = cv2.getTextSize(sup_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        cv2.putText(frame, sup_text,
+                    (frame.shape[1]//2 - ts_sup[0]//2, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # Check waypoint advancement if in AUTO
+        if vehicle.mode.name == 'AUTO' and suppression_target_index is not None:
+            try:
+                current_wp = vehicle.commands.next
+                if current_wp != suppression_target_index:
+                    # Waypoint advanced -> end suppression
+                    detection_suppressed = False
+                    log_nav_event('suppression_end', reason='waypoint_advanced', from_index=suppression_target_index, new_index=current_wp)
+                    print(f"[NAV] Suppression ended (waypoint advanced {suppression_target_index} -> {current_wp})")
+                elif (current_time - suppression_start_time) > suppression_timeout_s:
+                    # Timeout fallback
+                    detection_suppressed = False
+                    log_nav_event('suppression_end', reason='timeout')
+                    print("[NAV] Suppression timeout reached - re-enabling detections.")
+            except Exception as e:
+                print(f"[NAV] Suppression waypoint check error: {e}")
+        # Skip rest of detection handling while suppressed
+        return
     
     # Handle mode switching automatically based on detections
     # This always runs because mode_switch_on_detection is always True
     
-    # First check for detections to determine if we should enter GUIDED mode
-    has_detections = False
+    # Raw detection evaluation + debounce
+    has_detections_raw = False
+    # Determine most-centered detection and compute normalized horizontal error
+    frame_h, frame_w = frame.shape[:2]
+    frame_cx = frame_w / 2.0
+    frame_cy = frame_h / 2.0
+    most_centered = None
+    most_centered_dist = None
     for detection in detections:
         conf = detection.conf.item()
         if conf > min_thresh:
-            has_detections = True
-            # Update time of last detection - need to use global keyword
-            global last_detection_confirmed_time
-            last_detection_confirmed_time = current_time
-            break
+            # Mark presence of any raw detections
+            has_detections_raw = True
+            xyxy = detection.xyxy.cpu().numpy().squeeze()
+            xmin, ymin, xmax, ymax = xyxy.astype(int)
+            cx = (xmin + xmax) / 2.0
+            cy = (ymin + ymax) / 2.0
+            dist = ((cx - frame_cx) ** 2 + (cy - frame_cy) ** 2) ** 0.5
+            if most_centered_dist is None or dist < most_centered_dist:
+                most_centered_dist = dist
+                most_centered = (int(cx), int(cy), xmin, ymin, xmax, ymax)
+
+    # If we found a most-centered detection compute horizontal error
+    center_error = None
+    if most_centered:
+        mcx, mcy, xmin, ymin, xmax, ymax = most_centered
+        center_error = (mcx - frame_cx) / frame_cx  # range approx [-1..1]
+        # Visual marker (distinct from existing MOST CENTERED marker if any)
+        cv2.putText(frame, f"ERR {center_error:+.2f}", (mcx+10, mcy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+        bbox_height_px = ymax - ymin
+        est_distance_m = None
+        if focal_length_px and known_object_height_mm and bbox_height_px > 0:
+            distance_mm = (known_object_height_mm * focal_length_px) / bbox_height_px
+            est_distance_m = distance_mm / 1000.0
+            # Smooth distance via EMA
+            if approach_state.last_distance_m is None:
+                approach_state.last_distance_m = est_distance_m
+            else:
+                approach_state.last_distance_m = (distance_filter_alpha * est_distance_m +
+                                                  (1 - distance_filter_alpha) * approach_state.last_distance_m)
+
+        # Update approach state tracking if active
+        if approach_state.active:
+            approach_state.center_x = mcx
+            approach_state.center_y = mcy
+            approach_state.center_error = center_error
+            approach_state.bbox_height_px = bbox_height_px
+    global detection_consecutive_frames, last_detection_confirmed_time
+    if has_detections_raw:
+        detection_consecutive_frames += 1
+    else:
+        detection_consecutive_frames = 0
+    has_detections = detection_consecutive_frames >= detection_required_frames
+    if has_detections:
+        last_detection_confirmed_time = current_time
     
     current_mode = vehicle.mode.name
     
@@ -492,8 +663,7 @@ def handle_detections(detections, frame):
             mode_switch_time = current_time
             
             # Safety first - stop the vehicle by setting motors to neutral
-            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
+            set_neutral_motors()
             
             # Show mode switch notification (centered)
             text = f"SWITCHING MODES: {current_mode} → MANUAL"
@@ -503,6 +673,21 @@ def handle_detections(detections, frame):
                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         except Exception as e:
             print(f"Error switching mode: {e}")
+
+        # Hybrid navigation activation (skeleton)
+        if pixhawk_enabled and nav_mode == 'direct_control' and not approach_state.active:
+            approach_state.active = True
+            approach_state.start_time = current_time
+            approach_state.last_seen_time = current_time
+            approach_state.phase = 'align'
+            print("[NAV] ApproachState activated (phase=align). Awaiting center calculation integration.")
+            # Initialize error values if available
+            approach_state.center_error = center_error
+            if most_centered:
+                approach_state.center_x = most_centered[0]
+                approach_state.center_y = most_centered[1]
+                approach_state.bbox_height_px = (most_centered[5] - most_centered[4]) if len(most_centered) >= 6 else None
+            log_nav_event('approach_start', mode=current_mode)
     
     # If we're in detection mode, show status and check for switching back
     if in_detection_mode:
@@ -546,6 +731,21 @@ def handle_detections(detections, frame):
             cv2.putText(frame, text, 
                        (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # Basic placeholder: show NAV active status if diversion started
+            if approach_state.active:
+                remaining = max_approach_time_s - (current_time - approach_state.start_time)
+                nav_text = f"NAV divert phase={approach_state.phase} t_left={remaining:.1f}s"
+                ts2 = cv2.getTextSize(nav_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                cv2.putText(frame, nav_text,
+                            (frame.shape[1]//2 - ts2[0]//2, frame.shape[0] - 145),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+                # Show current horizontal error if available
+                if approach_state.center_error is not None:
+                    err_text = f"center_error={approach_state.center_error:+.2f}"
+                    ts3 = cv2.getTextSize(err_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                    cv2.putText(frame, err_text,
+                                (frame.shape[1]//2 - ts3[0]//2, frame.shape[0] - 165),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,200,200), 1)
         else:
             remaining_time = mode_switch_duration - time_since_last_detection
             text = f"No detections - returning to {original_mode} in: {remaining_time:.1f}s"
@@ -556,6 +756,139 @@ def handle_detections(detections, frame):
     
     # If motor control is disabled, still allow mode switching but don't control motors
     if not motor_control_enabled:
+        return
+
+    # Navigation diversion logic
+    if approach_state.active:
+        # Abort: lost target
+        if (current_time - last_detection_confirmed_time) > lost_target_timeout_s:
+            print("[NAV] Lost target - aborting diversion.")
+            approach_state.active = False
+            approach_state.phase = 'abort'
+            set_neutral_motors()
+            log_nav_event('abort', reason='lost_target')
+            return
+        # Abort: max time
+        if (current_time - approach_state.start_time) > max_approach_time_s:
+            print("[NAV] Max approach time exceeded - aborting diversion.")
+            approach_state.active = False
+            approach_state.phase = 'abort'
+            set_neutral_motors()
+            log_nav_event('abort', reason='timeout')
+            return
+
+        # Require center error to proceed
+        if approach_state.center_error is None:
+            # Still waiting for a detection with center data
+            return
+
+        # Phase transitions
+        if approach_state.phase == 'align':
+            # If mostly centered, move to advance
+            if abs(approach_state.center_error) < 0.05:
+                approach_state.phase = 'advance'
+                print("[NAV] Alignment achieved -> advancing.")
+                log_nav_event('phase_change', new_phase='advance')
+        
+        # Determine differential thrust
+        err = max(-1.0, min(1.0, approach_state.center_error))
+        base = forward_thrust_pwm
+        # Differential: turn_gain applied; invert sign if needed for platform orientation
+        right_pwm = int(base - turn_gain_pwm * err)
+        left_pwm  = int(base + turn_gain_pwm * err)
+        # Clip to safe bounds
+        def clip_pwm(val):
+            return max(1200, min(1900, val))
+        right_pwm = clip_pwm(right_pwm)
+        left_pwm  = clip_pwm(left_pwm)
+
+        # ALIGN phase handling: optionally hold completely neutral until centered
+        if approach_state.phase == 'align':
+            if align_hold:
+                right_pwm = 1335
+                left_pwm = 1500
+            else:
+                # legacy slow creep behavior
+                right_pwm = int((right_pwm + 1335) / 2)
+                left_pwm  = int((left_pwm + 1500) / 2)
+
+        # Idle brake: if detections temporarily lost, stop forward thrust but keep phase
+        no_detect_elapsed = current_time - last_detection_confirmed_time
+        if no_detect_elapsed > idle_brake_s and approach_state.phase in ('align','advance'):
+            # Only remove forward thrust, keep slight differential for heading correction if desired
+            # For now: full neutral both motors
+            right_pwm = 1335
+            left_pwm = 1500
+
+        # Apply or simulate
+        if simulate_navigation or vehicle is None or not vehicle.armed:
+            print(f"[NAV][SIM] phase={approach_state.phase} err={err:+.2f} right_pwm={right_pwm} left_pwm={left_pwm}")
+        else:
+            try:
+                vehicle.channels.overrides['1'] = right_pwm
+                vehicle.channels.overrides['3'] = left_pwm
+            except Exception as e:
+                print(f"[NAV] Override error: {e}")
+        # Periodic thrust logging (1s cadence)
+        if current_time - approach_state.last_thrust_log_time >= 1.0:
+            log_nav_event('thrust', right_pwm=right_pwm, left_pwm=left_pwm, err=err)
+            approach_state.last_thrust_log_time = current_time
+
+        # Overlay current thrust values
+        thrust_text = f"THR R:{right_pwm} L:{left_pwm} phase={approach_state.phase}"
+        ts_thr = cv2.getTextSize(thrust_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        cv2.putText(frame, thrust_text,
+                    (frame.shape[1]//2 - ts_thr[0]//2, frame.shape[0] - 185),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,180,255), 1)
+
+        # Arrival condition: either distance below threshold or bbox height above arrival threshold
+        arrived = False
+        if approach_state.last_distance_m is not None and approach_state.last_distance_m <= collection_distance_m:
+            arrived = True
+        elif approach_state.bbox_height_px is not None and approach_state.bbox_height_px >= arrival_bbox_min_px:
+            arrived = True
+
+        if arrived and approach_state.phase in ('align','advance'):
+            print(f"[NAV] Arrival reached (distance={approach_state.last_distance_m}, bbox_h={approach_state.bbox_height_px}). Holding and completing diversion.")
+            set_neutral_motors()
+            approach_state.phase = 'collect'
+            # Display arrival message
+            arr_text = "ARRIVED - NEUTRAL HOLD"
+            ts_arr = cv2.getTextSize(arr_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.putText(frame, arr_text,
+                        (frame.shape[1]//2 - ts_arr[0]//2, frame.shape[0] - 205),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            # Mark diversion complete; allow mode logic to revert via existing timer or immediate if desired
+            approach_state.active = False
+            # Optionally shorten mode_switch_duration on arrival (future improvement)
+            approach_state.completed = True
+            log_nav_event('arrival', distance=approach_state.last_distance_m, bbox_h=approach_state.bbox_height_px)
+            # Immediate AUTO resume if we switched from AUTO earlier
+            if in_detection_mode and original_mode is not None:
+                try:
+                    vehicle.mode = VehicleMode(original_mode)
+                    vehicle.channels.overrides = {}
+                    in_detection_mode = False
+                    log_nav_event('resume_auto', prev_mode='MANUAL')
+                    print("[NAV] Switched back to AUTO immediately after arrival.")
+                    # Begin suppression until next waypoint advances
+                    try:
+                        suppression_target_index = vehicle.commands.next
+                        detection_suppressed = True
+                        suppression_start_time = time.time()
+                        log_nav_event('suppression_start', target_index=suppression_target_index)
+                        print(f"[NAV] Detection suppression started (waiting for waypoint index to advance from {suppression_target_index}).")
+                    except Exception as e:
+                        print(f"[NAV] Could not start suppression (command index unavailable): {e}")
+                    original_mode = None
+                except Exception as e:
+                    print(f"[NAV] Error resuming AUTO: {e}")
+            return
+
+        # Arrival placeholder (bbox size heuristic if available)
+        # Using most_centered from earlier scope is not directly accessible here; future improvement can pass size.
+        # For now, rely on distance estimate if available in future integration.
+        # (Arrival condition will be implemented in next step.)
         return
     
     # Get current time
@@ -575,7 +908,7 @@ def handle_detections(detections, frame):
             
             # Continue enforcing neutral position while in detection mode
             if in_detection_mode:
-                vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Keep motors at neutral
+                set_neutral_motors()
                 
                 # Show status message (moved to bottom)
                 text = "PAUSE COMPLETE - AWAITING MODE SWITCH"
@@ -598,7 +931,7 @@ def handle_detections(detections, frame):
             # SIMPLIFIED APPROACH: Keep motors at neutral
             # No checks, no diagnostics that might interfere
             # Simply enforce neutral position throughout the entire 5-second duration
-            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment
+            set_neutral_motors()
             
             # Only log status once per second without any checks or modifications
             if int(elapsed_time) % 1 == 0:  # Log once per second
@@ -653,7 +986,7 @@ def handle_detections(detections, frame):
             
             # SIMPLIFIED APPROACH: Just set motors to neutral directly
             # No checks, no diagnostics that might interfere
-            vehicle.channels.overrides = {'1': 1335, '3': 1500}  # Direct assignment to neutral positions
+            set_neutral_motors()
             
             # Record start time and activate flag immediately
             motor_start_time = current_time
@@ -767,7 +1100,7 @@ def process_frame(frame):
                         print("Setting motors to neutral positions...")
                         
                         # Set motors to neutral with direct dictionary assignment
-                        vehicle.channels.overrides = {'1': 1335, '3': 1500}
+                        set_neutral_motors()
             except Exception as e:
                 print(f"Safety check error: {e}")
         
@@ -785,7 +1118,7 @@ print("  'p': Save screenshot")
 print("  'c': Reconnect to Pixhawk (if disconnected)")
 print("  'd': Run diagnostic port scan")
 print("  'h': Show Pixhawk command help")
-print("  'e': Enable/disable motor pause on detection")
+print("  'e': Toggle auto navigation thrust (diversion ON/OFF)")
 print("  'r': Test right motor (channel 1)")
 print("  'l': Test left motor (channel 3)")
 # Mode switching is now automatic
@@ -801,382 +1134,315 @@ vehicle = None
 # (to avoid multiple redundant messages)
 motors_forced_off = False
 
-# Automatically connect to Pixhawk on startup
+"""Attempt initial Pixhawk connection if enabled in config."""
 if DRONEKIT_AVAILABLE:
-    print("\nConnecting to Pixhawk on /dev/ttyAMA0 at 57600 baud...")
-    
-    # Set known good connection parameters
-    port = '/dev/ttyAMA0'
-    baud = 57600
-    
-    # Check if port exists and has proper permissions
-    if not os.path.exists(port):
-        print(f"ERROR: Port {port} does not exist!")
-        print("UART may not be enabled. Try running:")
-        print("sudo raspi-config > Interface Options > Serial")
-    else:
-        # Try to fix permissions if needed
-        if not os.access(port, os.R_OK | os.W_OK):
-            print(f"WARNING: Permission issues on {port}")
-            print("Attempting to fix permissions...")
+    if pixhawk_enabled:
+        print(f"\nConnecting to Pixhawk on {pixhawk_connection} at {pixhawk_baud} baud...")
+        port = pixhawk_connection
+        baud = pixhawk_baud
+        # Check if port exists and has proper permissions
+        if not os.path.exists(port):
+            print(f"ERROR: Port {port} does not exist!")
+            print("UART may not be enabled. Try running:")
+            print("sudo raspi-config > Interface Options > Serial")
+        else:
+            # Try to fix permissions if needed
+            if not os.access(port, os.R_OK | os.W_OK):
+                print(f"WARNING: Permission issues on {port}")
+                print("Attempting to fix permissions...")
+                try:
+                    import subprocess
+                    subprocess.run(['sudo', 'chmod', '666', port])
+                    print("Permissions updated.")
+                except:
+                    print(f"Could not update permissions. Try running: sudo chmod 666 {port}")
+            # Try connection
             try:
-                import subprocess
-                subprocess.run(['sudo', 'chmod', '666', port])
-                print("Permissions updated.")
-            except:
-                print(f"Could not update permissions. Try running: sudo chmod 666 {port}")
-        
-        # Try connection
-        try:
-            connection_success = connect_pixhawk(port, baud)
-            if connection_success and vehicle is not None:
-                vehicle_status = get_vehicle_status()
-                print(f"SUCCESS! Connected on {port} at {baud} baud")
-                print(f"Vehicle status: {vehicle_status}")
-                # Save settings for reconnection if needed
-                successful_port = port
-                successful_baud = baud
-            else:
-                print(f"Failed to connect to Pixhawk on {port} at {baud} baud.")
-                print("Check your physical connection and Pixhawk power.")
+                connection_success = connect_pixhawk(port, baud)
+                if connection_success and vehicle is not None:
+                    vehicle_status = get_vehicle_status()
+                    print(f"SUCCESS! Connected on {port} at {baud} baud")
+                    print(f"Vehicle status: {vehicle_status}")
+                    # Save settings for reconnection if needed
+                    successful_port = port
+                    successful_baud = baud
+                else:
+                    print(f"Failed to connect to Pixhawk on {port} at {baud} baud.")
+                    print("Check your physical connection and Pixhawk power.")
+                    print("You can try reconnecting manually by pressing 'c' during operation.")
+            except Exception as e:
+                print(f"Connection error: {e}")
                 print("You can try reconnecting manually by pressing 'c' during operation.")
-        except Exception as e:
-            print(f"Connection error: {e}")
-            print("You can try reconnecting manually by pressing 'c' during operation.")
+    else:
+        print("Pixhawk connection disabled via config (pixhawk.control_enabled = false)")
 else:
     print("DroneKit is not available. Pixhawk connection disabled.")
 
-while True:
-    t_start = time.perf_counter()
-    # Capture frame
-    if source_type == 'usb':
-        ret, frame = cap.read()
-        if not ret:
-            print('Unable to read from webcam. Check connection.')
-            break
-    else:
-        try:
-            frame = cap.capture_array()
-            if frame is None:
-                print('Unable to read from Picamera. Check connection.')
+try:
+    while True:
+        t_start = time.perf_counter()
+        # Capture frame
+        if source_type == 'usb':
+            ret, frame = cap.read()
+            if not ret:
+                print('Unable to read from webcam. Check connection.')
                 break
-            frame = np.ascontiguousarray(frame)
-        except Exception as e:
-            print(f'Error capturing from Picamera: {e}')
-            break
-    # Process and annotate frame
-    frame, object_count = process_frame(frame)
-    
-    # Draw FPS and object count
-    cv2.putText(frame, f'FPS: {avg_frame_rate:0.1f}', (10,30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-    cv2.putText(frame, f'Objects: {object_count}', (10,60), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-    cv2.putText(frame, f'Confidence: {int(min_thresh*100)}%', (10,90), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-    
-    # Display Pixhawk connection status if applicable
-    if DRONEKIT_AVAILABLE:
-        if vehicle is not None:
-            connection_status = "Connected"
-            color = (0,255,0)  # Green
         else:
-            connection_status = "Not connected (Press 'c' to connect)"
-            color = (0,0,255)  # Red
-        cv2.putText(frame, f'Pixhawk: {connection_status}', (10,120), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                    
-    # Display motor pause status
-    motor_status = "ENABLED" if motor_control_enabled else "DISABLED"
-    motor_color = (0,0,255) if motor_control_enabled else (0,255,0)  # Red if enabled, green if disabled
-    cv2.putText(frame, f'Motor Pause: {motor_status}', (10,150),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, motor_color, 2)
-                
-    # Display mode switching status (always enabled)
-    cv2.putText(frame, f'Auto Mode Switch: ENABLED', (10,180),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)  # Always red since it's always on
-                
-    # Display armed status
-    if vehicle is not None:
-        if vehicle.armed:
-            cv2.putText(frame, f'ARMED', (10,210),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)  # Red for armed
-            
-            # Check if motors are running when they shouldn't be
             try:
-                right_motor = vehicle.channels['1'] 
-                left_motor = vehicle.channels['3']
-                
-                # Check if motors are significantly off from their specific neutral positions
-                if (abs(right_motor - 1335) > 50 or abs(left_motor - 1500) > 50) and not motor_control_enabled:
-                    # Display warning about unexpected motor activation
-                    warning = "WARNING: MOTORS ACTIVE!"
-                    cv2.putText(frame, warning, (resW//2 - 150, 40),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)  # Red warning
-                    
-                    # Show motor values
-                    motor_text = f"R:{right_motor} L:{left_motor}"
-                    cv2.putText(frame, motor_text, (resW//2 - 80, 80),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-            except:
-                pass  # Skip if can't read channels
-        else:
-            cv2.putText(frame, f'DISARMED', (10,210),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)  # Green for disarmed
-        
-        # Display current flight mode
-        cv2.putText(frame, f'Mode: {vehicle.mode.name}', (10,240),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)  # Yellow for mode
-    frame_center = (resW // 2, resH // 2)
-    cv2.line(frame, (frame_center[0], 0), (frame_center[0], resH), (0, 255, 255), 2)
-    cv2.line(frame, (0, frame_center[1]), (resW, frame_center[1]), (0, 255, 255), 2)
-    cv2.imshow('YOLO Detection', frame)
-    if record:
-        recorder.write(frame)
-    key = cv2.waitKey(1)
-    if key == ord('q'):
-        break
-    elif key == ord('s'):
-        cv2.waitKey(0)  # Pause
-    elif key == ord('p'):
-        cv2.imwrite('capture.png', frame)  # Save image
-    elif key == ord('d'):
-        # Run port diagnostic
-        print("\nRunning diagnostic port scan...")
-        diagnostic_port_scan()
-    elif key == ord('c'):
-        # Try to reconnect to Pixhawk if disconnected
+                frame = cap.capture_array()
+                if frame is None:
+                    print('Unable to read from Picamera. Check connection.')
+                    break
+                frame = np.ascontiguousarray(frame)
+            except Exception as e:
+                print(f'Error capturing from Picamera: {e}')
+                break
+        # Process and annotate frame
+        frame, object_count = process_frame(frame)
+
+        # Draw FPS and object count
+        cv2.putText(frame, f'FPS: {avg_frame_rate:0.1f}', (10,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+        cv2.putText(frame, f'Objects: {object_count}', (10,60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+        cv2.putText(frame, f'Confidence: {int(min_thresh*100)}%', (10,90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+        # Display Pixhawk connection status if applicable
         if DRONEKIT_AVAILABLE:
             if vehicle is not None:
+                connection_status = "Connected"
+                color = (0,255,0)
+            else:
+                connection_status = "Not connected (Press 'c' to connect)"
+                color = (0,0,255)
+            cv2.putText(frame, f'Pixhawk: {connection_status}', (10,120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # Display motor pause status
+        motor_status = "ENABLED" if motor_control_enabled else "DISABLED"
+        motor_color = (0,0,255) if motor_control_enabled else (0,255,0)
+        cv2.putText(frame, f'Motor Pause: {motor_status}', (10,150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, motor_color, 2)
+
+        # Display mode switching status (always enabled)
+        cv2.putText(frame, f'Auto Mode Switch: ENABLED', (10,180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+        # Display armed status
+        if vehicle is not None:
+            if vehicle.armed:
+                cv2.putText(frame, f'ARMED', (10,210),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
                 try:
-                    # Test if the connection is still alive
-                    test_mode = vehicle.mode.name
-                    print("\nPixhawk is still connected. Current status:")
-                    vehicle_status = get_vehicle_status()
-                    print(f"Vehicle status: {vehicle_status}")
+                    right_motor = vehicle.channels['1']
+                    left_motor = vehicle.channels['3']
+                    if (abs(right_motor - 1335) > 50 or abs(left_motor - 1500) > 50) and not motor_control_enabled:
+                        warning = "WARNING: MOTORS ACTIVE!"
+                        cv2.putText(frame, warning, (resW//2 - 150, 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+                        motor_text = f"R:{right_motor} L:{left_motor}"
+                        cv2.putText(frame, motor_text, (resW//2 - 80, 80),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
                 except Exception:
-                    print("\nConnection lost. Attempting to reconnect...")
-                    vehicle = None
-            
-            if vehicle is None:
-                # Use known port and baud rate for connection
-                port = '/dev/ttyAMA0'
-                baud = 57600
-                
-                print(f"\nAttempting to reconnect to Pixhawk on {port} at {baud} baud...")
-                
-                # Check if port exists and has proper permissions
-                if not os.path.exists(port):
-                    print(f"ERROR: Port {port} does not exist!")
-                else:
-                    # Attempt to connect
+                    pass
+            else:
+                cv2.putText(frame, f'DISARMED', (10,210),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(frame, f'Mode: {vehicle.mode.name}', (10,240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+
+        frame_center = (resW // 2, resH // 2)
+        cv2.line(frame, (frame_center[0], 0), (frame_center[0], resH), (0, 255, 255), 2)
+        cv2.line(frame, (0, frame_center[1]), (resW, frame_center[1]), (0, 255, 255), 2)
+        cv2.imshow('YOLO Detection', frame)
+        if record:
+            recorder.write(frame)
+        key = cv2.waitKey(1)
+        if key == ord('q'):
+            break
+        elif key == ord('s'):
+            cv2.waitKey(0)
+        elif key == ord('p'):
+            cv2.imwrite('capture.png', frame)
+        elif key == ord('d'):
+            print("\nRunning diagnostic port scan...")
+            diagnostic_port_scan()
+        elif key == ord('c'):
+            if DRONEKIT_AVAILABLE:
+                if vehicle is not None:
                     try:
-                        if connect_pixhawk(port, baud):
-                            vehicle_status = get_vehicle_status()
-                            print(f"Reconnected! Vehicle status: {vehicle_status}")
-                        else:
-                            print(f"Failed to reconnect to Pixhawk on {port} at {baud} baud.")
-                            print("Check your physical connection and Pixhawk power.")
-                    except Exception as e:
-                        print(f"Reconnection error: {e}")
-        else:
-            print("DroneKit is not available. Cannot connect to Pixhawk.")
-    # Pixhawk command keys
-    elif key == ord('h'):
-        # Show help for Pixhawk commands
-        show_command_help()
-    elif key == ord('m'):
-        # Change flight mode
-        if vehicle:
-            available_modes = ['STABILIZE', 'ALT_HOLD', 'LOITER', 'GUIDED', 'AUTO', 'RTL', 'LAND']
-            print("\nAvailable flight modes:", ", ".join(available_modes))
-            print("Current mode:", vehicle.mode.name)
-            print("NOTE: Mode switching is now automatic based on detections")
-            print("Current mode:", vehicle.mode.name)
-            print("Enter first letter of mode or full mode name (e.g., 's' or 'STABILIZE')")
-            cv2.putText(frame, "Enter mode in terminal", (resW//3, resH//2), 
-                      cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
-            cv2.imshow('YOLO Detection', frame)
-            cv2.waitKey(1)
-            
-            mode_input = input("New mode: ").strip().upper()
-            
-            # Handle single letter input
-            if len(mode_input) == 1:
-                for mode in available_modes:
-                    if mode.startswith(mode_input):
-                        mode_input = mode
-                        break
-            
-            # Verify mode is valid
-            if mode_input in available_modes:
-                set_flight_mode(mode_input)
+                        test_mode = vehicle.mode.name
+                        print("\nPixhawk is still connected. Current status:")
+                        vehicle_status = get_vehicle_status()
+                        print(f"Vehicle status: {vehicle_status}")
+                    except Exception:
+                        print("\nConnection lost. Attempting to reconnect...")
+                        vehicle = None
+                if vehicle is None:
+                    port = '/dev/ttyAMA0'
+                    baud = 57600
+                    print(f"\nAttempting to reconnect to Pixhawk on {port} at {baud} baud...")
+                    if not os.path.exists(port):
+                        print(f"ERROR: Port {port} does not exist!")
+                    else:
+                        try:
+                            if connect_pixhawk(port, baud):
+                                vehicle_status = get_vehicle_status()
+                                print(f"Reconnected! Vehicle status: {vehicle_status}")
+                            else:
+                                print(f"Failed to reconnect to Pixhawk on {port} at {baud} baud.")
+                                print("Check your physical connection and Pixhawk power.")
+                        except Exception as e:
+                            print(f"Reconnection error: {e}")
             else:
-                print(f"Invalid mode: {mode_input}")
-        else:
-            print("Pixhawk not connected! Connect first.")
-    elif key == ord('a'):
-        # Arm motors
-        if vehicle:
-            if arm_disarm(True):
-                # After successful arming, explicitly ensure motors are at their specific neutral positions
-                print("Setting all motors to neutral position after arming...")
-                # Set motor channels directly to their specific neutral positions
-                vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-                vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
-        else:
-            print("Pixhawk not connected! Connect first.")
-    elif key == ord('f'):
-        # Disarm motors
-        if vehicle:
-            arm_disarm(False)
-        else:
-            print("Pixhawk not connected! Connect first.")
-    elif key == ord('t'):
-        # Takeoff to 2 meters
-        if vehicle:
-            if set_flight_mode('GUIDED'):  # Must be in GUIDED mode to takeoff
-                takeoff(2.0)  # 2 meters altitude
-            else:
-                print("Failed to enter GUIDED mode for takeoff")
-        else:
-            print("Pixhawk not connected! Connect first.")
-    elif key == ord('l'):
-        # Land the vehicle
-        if vehicle:
-            try:
-                print("\nAttempting to switch to LAND mode...")
-                vehicle.mode = VehicleMode("LAND")
-                time.sleep(0.5)
-                print(f"Current mode: {vehicle.mode.name}")
-            except Exception as e:
-                print(f"Error changing to LAND mode: {e}")
-        else:
-            print("No connection to vehicle. Cannot land.")# Either Land mode or test left motor depending on modifier key
-        if cv2.getWindowProperty('YOLO Detection', cv2.WND_PROP_VISIBLE) < 1:
-            # Window not in focus, assume terminal is - this is for Land mode
+                print("DroneKit is not available. Cannot connect to Pixhawk.")
+        elif key == ord('h'):
+            show_command_help()
+        elif key == ord('m'):
             if vehicle:
-                set_flight_mode('LAND')
+                # Filtered to common ArduRover / general modes. Removed Copter-only modes like STABILIZE, ALT_HOLD, LOITER, LAND.
+                available_modes = ['MANUAL', 'HOLD', 'GUIDED', 'AUTO', 'RTL']
+                print("\nAvailable flight modes:", ", ".join(available_modes))
+                print("Current mode:", vehicle.mode.name)
+                print("NOTE: Mode switching is now automatic based on detections")
+                print("Current mode:", vehicle.mode.name)
+                print("Enter first letter of mode or full mode name (e.g., 's' or 'STABILIZE')")
+                cv2.putText(frame, "Enter mode in terminal", (resW//3, resH//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+                cv2.imshow('YOLO Detection', frame)
+                cv2.waitKey(1)
+                mode_input = input("New mode: ").strip().upper()
+                if len(mode_input) == 1:
+                    for mode in available_modes:
+                        if mode.startswith(mode_input):
+                            mode_input = mode
+                            break
+                if mode_input in available_modes:
+                    set_flight_mode(mode_input)
+                else:
+                    print(f"Invalid mode: {mode_input}")
             else:
                 print("Pixhawk not connected! Connect first.")
-        else:
-            # Window in focus - test left motor (channel 3)
+        elif key == ord('a'):
+            if vehicle:
+                if arm_disarm(True):
+                    print("Setting all motors to neutral position after arming...")
+                    set_neutral_motors()
+            else:
+                print("Pixhawk not connected! Connect first.")
+        elif key == ord('f'):
+            if vehicle:
+                arm_disarm(False)
+            else:
+                print("Pixhawk not connected! Connect first.")
+        elif key == ord('t'):
+            if vehicle:
+                if set_flight_mode('GUIDED'):
+                    takeoff(2.0)
+                else:
+                    print("Failed to enter GUIDED mode for takeoff")
+            else:
+                print("Pixhawk not connected! Connect first.")
+        elif key == ord('l'):
+            # Repurposed: Left motor test ONLY (LAND unsupported for ArduRover)
+            if not vehicle:
+                print("Pixhawk not connected! Connect first.")
+            else:
+                if not vehicle.armed:
+                    print("Vehicle not armed. Arm ('a') before motor test.")
+                else:
+                    print("\nLEFT MOTOR TEST (channel 3) -- Safety: Ensure prop clear and vessel secure")
+                    print("Applying 1894 PWM for 5 seconds, then returning to neutral (1500)...")
+                    try:
+                        vehicle.channels.overrides['3'] = 1894
+                        time.sleep(5.0)
+                    finally:
+                        vehicle.channels.overrides['3'] = 1500
+                    print("Left motor test complete.")
+                    print("Use 'r' for right motor test.")
+        elif key == ord('r'):
             if vehicle and vehicle.armed:
-                print("\nTesting left motor (channel 3)...")
+                print("\nTesting right motor (channel 1)...")
                 print("Setting to maximum throttle (1894) for 5 seconds...")
-                # Set right motor explicitly to its neutral and left motor to test value
-                vehicle.channels.overrides['1'] = 1335  # Right motor specific neutral
-                vehicle.channels.overrides['3'] = 1894  # Left motor maximum power
-                
-                # Keep power for full 5 seconds
-                print("Left motor activated at 1894 for 5 seconds...")
+                vehicle.channels.overrides['3'] = 1500
+                vehicle.channels.overrides['1'] = 1894
+                print("Right motor activated at 1894 for 5 seconds...")
                 time.sleep(5.0)
-                
-                # Return to neutral position
-                vehicle.channels.overrides['3'] = 1500  # Left motor specific neutral
-                print("Left motor test complete")
+                vehicle.channels.overrides['1'] = 1335
+                print("Right motor test complete")
             else:
                 print("Pixhawk not connected or not armed! Connect and arm first.")
-    elif key == ord('r'):
-        # Test right motor (channel 1)
-        if vehicle and vehicle.armed:
-            print("\nTesting right motor (channel 1)...")
-            print("Setting to maximum throttle (1894) for 5 seconds...")
-            # Set left motor explicitly to its neutral and right motor to test value
-            vehicle.channels.overrides['3'] = 1500  # Left motor neutral
-            vehicle.channels.overrides['1'] = 1894  # Right motor maximum power
-            
-            # Keep power for full 5 seconds
-            print("Right motor activated at 1894 for 5 seconds...")
-            time.sleep(5.0)
-            
-            # Return to neutral position
-            vehicle.channels.overrides['1'] = 1335  # Right motor specific neutral
-            print("Right motor test complete")
-        else:
-            print("Pixhawk not connected or not armed! Connect and arm first.")
-    elif key == ord('e'):
-        # Toggle detection-based motor pause
-        motor_control_enabled = not motor_control_enabled
-        status = "ENABLED" if motor_control_enabled else "DISABLED"
-        print(f"\nMotor pause on detection {status}")
-        
-        # Display temporary message on screen (centered)
-        temp_frame = frame.copy()
-        message = f"Motor Pause: {status}"
-        textsize = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
-        cv2.putText(temp_frame, message, (resW//2 - textsize[0]//2, resH//2), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, 
-                   (0,0,255) if motor_control_enabled else (0,255,0), 3)
-        
-    # No longer need to toggle mode switching as it's always enabled
-
-        # If we're disabling, make sure motors are at neutral
-        if not motor_control_enabled and vehicle and vehicle.armed:
-            print("Disabling motor control and setting motors to their specific neutral positions")
-            # Reset motor active flag
-            motor_active = False
-            # Set motors directly to their specific neutral positions
-            vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-            vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
-    elif key == ord('z'):
-        # Return to Launch
-        if vehicle:
-            if set_flight_mode('RTL'):
-                print("Vehicle returning to launch point")
+        elif key == ord('e'):
+            motor_control_enabled = not motor_control_enabled
+            status = "ACTIVE" if motor_control_enabled else "INACTIVE"
+            print(f"\n[DIVERSION] Auto navigation thrust is now {status}")
+            temp_frame = frame.copy()
+            message = f"Auto Nav: {status}"
+            textsize = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
+            cv2.putText(temp_frame, message, (resW//2 - textsize[0]//2, resH//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0,0,255) if motor_control_enabled else (0,255,0), 3)
+            if not motor_control_enabled and vehicle and vehicle.armed:
+                print("Disabling auto thrust and setting motors to neutral")
+                motor_active = False
+                set_neutral_motors()
+        elif key == ord('z'):
+            if vehicle:
+                if set_flight_mode('RTL'):
+                    print("Vehicle returning to launch point")
+                else:
+                    print("Failed to enter RTL mode")
             else:
-                print("Failed to enter RTL mode")
+                print("Pixhawk not connected! Connect first.")
+        t_stop = time.perf_counter()
+        frame_rate = 1/(t_stop - t_start)
+        frame_rate_buffer.append(frame_rate)
+        if len(frame_rate_buffer) > fps_avg_len:
+            frame_rate_buffer.pop(0)
+        avg_frame_rate = np.mean(frame_rate_buffer)
+except KeyboardInterrupt:
+    print("Interrupted by user")
+except Exception as e:
+    print(f"Unhandled exception in main loop: {e}")
+finally:
+    # ---------------------------
+    # Cleanup (robust)
+    # ---------------------------
+    print(f'Average FPS: {avg_frame_rate:.1f}')
+    try:
+        if source_type == 'usb':
+            cap.release()
         else:
-            print("Pixhawk not connected! Connect first.")# Return to launch
-        if vehicle:
-            set_flight_mode('RTL')
-        else:
-            print("Pixhawk not connected! Connect first.")
-    t_stop = time.perf_counter()
-    frame_rate = 1/(t_stop - t_start)
-    frame_rate_buffer.append(frame_rate)
-    if len(frame_rate_buffer) > fps_avg_len:
-        frame_rate_buffer.pop(0)
-    avg_frame_rate = np.mean(frame_rate_buffer)
+            cap.stop()
+    except Exception:
+        pass
+    if record:
+        try:
+            recorder.release()
+        except Exception:
+            pass
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+    if vehicle is not None:
+        try:
+            print("Turning off all motor outputs...")
+            control_motors(right_motor_value=1335, left_motor_value=1500)
+            clear_all_motor_overrides()
+            set_neutral_motors()
+            time.sleep(0.3)
+            vehicle.channels.overrides = {}
+            print("Motor shutdown sequence complete")
+        except Exception as e:
+            print(f"Error during motor shutdown: {e}")
+        try:
+            vehicle.close()
+            print("Pixhawk connection closed.")
+        except Exception as e:
+            print(f"Error closing vehicle: {e}")
 
 # ---------------------------
 # Cleanup
 # ---------------------------
-
-print(f'Average FPS: {avg_frame_rate:.1f}')
-if source_type == 'usb':
-    cap.release()
-else:
-    cap.stop()
-if record:
-    recorder.release()
-cv2.destroyAllWindows()
-
-# Make sure motors are off and close Pixhawk connection
-if vehicle is not None:
-    # Safety: turn off all motor outputs with multiple approaches
-    try:
-        print("Turning off all motor outputs...")
-        
-        # Multiple methods to ensure motors are set to their specific neutral positions
-        # 1. Set individual channels to their specific neutral positions
-        control_motors(right_motor_value=1335, left_motor_value=1500)
-        
-        # 2. Clear all overrides
-        clear_all_motor_overrides()
-        
-        # 3. Set individual channels again to ensure correct neutral positions
-        vehicle.channels.overrides['1'] = 1335  # Right motor neutral (1335)
-        vehicle.channels.overrides['3'] = 1500  # Left motor neutral (1500)
-        
-        # 4. Wait a moment and clear again
-        time.sleep(0.5)
-        vehicle.channels.overrides = {}
-        
-        print("Motor shutdown sequence complete")
-    except Exception as e:
-        print(f"Error during motor shutdown: {e}")
-        
-    # Close connection
-    vehicle.close()
-    print("Pixhawk connection closed.")

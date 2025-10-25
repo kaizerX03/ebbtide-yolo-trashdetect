@@ -16,10 +16,30 @@ distance_estimation:
   known_object_height_mm: 120  # Set to the real-world height of your object in mm
 
 pixhawk:
-  connection: "/dev/ttyACM0"  # Serial connection to Pixhawk (may be ttyACM0, ttyS0, etc.)
+  connection: "/dev/ttyAMA0"  # Serial connection to Pixhawk (may be ttyACM0, ttyS0, etc.)
   baud_rate: 57600           # Default baud rate for Pixhawk
-  control_enabled: false      # Set to true to enable navigation control
-  trash_collection_mode: "waypoint_override"  # Options: "direct_control" or "waypoint_override"
+  control_enabled: true      # Set to true to enable navigation control
+  trash_collection_mode: "direct_control"  # Options: "direct_control" or "waypoint_override"
+
+navigation:
+  mode: "direct_control"            # direct_control | waypoint_override
+  forward_thrust_pwm: 1600           # Base forward thrust PWM (slightly above neutral)
+  turn_gain_pwm: 200                 # Differential added/subtracted for turning
+  collection_distance_m: 1.0         # Stop when estimated distance below this
+  lost_target_timeout_s: 3           # Abort if target lost for this duration
+  max_approach_time_s: 30            # Hard cap on diversion time
+  distance_filter_alpha: 0.3         # EMA smoothing factor for distance readings
+  camera_fov_deg: 60                 # Approx horizontal FOV of camera (for bearing calc later)
+  arrival_bbox_min_px: 120           # If bbox height exceeds this, treat as arrived (close enough)
+  logging_enabled: true              # Emit structured JSON navigation logs
+  log_file: "nav_events.log"         # Relative path for nav event log
+  suppression_timeout_s: 90          # Max time to suppress detections if waypoint not advanced
+  align_hold: true                   # Keep motors neutral during ALIGN phase (no creeping forward)
+  idle_brake_s: 2                  # If no detection for this many seconds while diverting, neutral thrust until detection returns
+
+detection_logic:
+  consecutive_frames: 2  # Number of consecutive frames required to confirm a detection (debounce)
+  enable_mode_switch: true  # If true, AUTO->MANUAL switching behavior remains active
 
 test_mode:
   enabled: false              # Set to true to enable test mode
