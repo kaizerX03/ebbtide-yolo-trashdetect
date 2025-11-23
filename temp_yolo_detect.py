@@ -69,14 +69,6 @@ distance_estimation_config = config.get('distance_estimation', {})
 focal_length_px = distance_estimation_config.get('focal_length_px')
 known_object_height_mm = distance_estimation_config.get('known_object_height_mm')
 detection_required_frames = int(config.get('detection_logic', {}).get('consecutive_frames', 2))
-
-# Collection camera configuration
-collection_cam_config = config.get('collection_camera', {})
-collection_cam_enabled = bool(collection_cam_config.get('enabled', False))
-collection_cam_source = collection_cam_config.get('source', 'usb0')
-collection_cam_res = collection_cam_config.get('resolution', '320x240')
-collection_line_percent = float(collection_cam_config.get('collection_line_percent', 0.7))
-collection_cam_fps = int(collection_cam_config.get('fps', 10))
 enable_mode_switch = bool(config.get('detection_logic', {}).get('enable_mode_switch', True))
 detection_consecutive_frames = 0
 pixhawk_settings = config.get('pixhawk', {})
@@ -127,11 +119,6 @@ approach_state = ApproachState()
 detection_suppressed = False
 suppression_target_index = None
 suppression_start_time = 0.0
-
-# Collection tracking
-total_trash_collected = 0
-last_collection_time = 0.0
-collection_cooldown = 3.0  # Prevent double-counting same trash
 
 def log_nav_event(event_type, **fields):
     if not nav_logging_enabled:
@@ -193,42 +180,6 @@ if record:
 
 bbox_colors = [(164,120,87), (68,148,228), (93,97,209), (178,182,133), (88,159,106), 
               (96,202,231), (159,124,168), (169,162,241), (98,118,150), (172,176,184)]
-
-# ---------------------------
-# Collection Camera Setup (Optional)
-# ---------------------------
-collection_cap = None
-collection_resW, collection_resH = 320, 240
-
-if collection_cam_enabled:
-    try:
-        collection_resW, collection_resH = map(int, collection_cam_res.split('x'))
-        
-        if 'usb' in collection_cam_source:
-            collection_idx = int(collection_cam_source[3:])
-            collection_cap = cv2.VideoCapture(collection_idx)
-            
-            if collection_cap.isOpened():
-                collection_cap.set(3, collection_resW)
-                collection_cap.set(4, collection_resH)
-                collection_cap.set(cv2.CAP_PROP_FPS, collection_cam_fps)
-                print(f"Collection camera initialized: {collection_cam_source} at {collection_cam_res}")
-            else:
-                print(f"WARNING: Could not open collection camera {collection_cam_source}")
-                collection_cap = None
-                collection_cam_enabled = False
-        else:
-            print("WARNING: Collection camera only supports USB cameras (usb0, usb1)")
-            collection_cam_enabled = False
-            
-    except Exception as e:
-        print(f"WARNING: Failed to initialize collection camera: {e}")
-        collection_cap = None
-        collection_cam_enabled = False
-else:
-    print("Collection camera disabled in config")
-
-collection_line_y = int(collection_resH * collection_line_percent)
 
 # ---------------------------
 # Pixhawk Integration
@@ -545,57 +496,6 @@ def control_motors(right_motor_value=None, left_motor_value=None, should_clear=F
     except Exception as e:
         print(f"Error controlling motors: {e}")
         return False
-
-def check_collection_confirmation(detections, frame):
-    """Check if trash crossed the collection line on conveyor camera.
-    
-    Args:
-        detections: YOLO detection results
-        frame: Camera frame
-        
-    Returns:
-        bool: True if trash crossed collection line
-    """
-    global total_trash_collected, last_collection_time
-    
-    # Draw collection line
-    cv2.line(frame, (0, collection_line_y), (collection_resW, collection_line_y), 
-             (0, 255, 0), 2)
-    cv2.putText(frame, 'COLLECTION LINE', (10, collection_line_y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    
-    current_time = time.time()
-    
-    # Check cooldown to prevent double-counting
-    if current_time - last_collection_time < collection_cooldown:
-        return False
-    
-    # Check if any trash bbox crosses the line
-    for detection in detections:
-        conf = detection.conf.item()
-        if conf > min_thresh:
-            xyxy = detection.xyxy.cpu().numpy().squeeze()
-            xmin, ymin, xmax, ymax = xyxy.astype(int)
-            bbox_bottom = ymax
-            
-            # Draw bbox on collection camera
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 255), 2)
-            
-            # Check if bottom of bbox crossed the collection line
-            if bbox_bottom >= collection_line_y:
-                total_trash_collected += 1
-                last_collection_time = current_time
-                
-                # Visual feedback
-                cv2.putText(frame, 'COLLECTED!', (xmin, ymin - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                print(f"[COLLECTION] Trash collected! Total: {total_trash_collected}")
-                log_nav_event('trash_collected', total_count=total_trash_collected)
-                
-                return True
-    
-    return False
 
 def show_command_help():
     """Display available commands for the Pixhawk."""
@@ -1279,9 +1179,6 @@ else:
     print("DroneKit is not available. Pixhawk connection disabled.")
 
 try:
-    collection_frame_counter = 0
-    collection_frame_skip = max(1, 30 // collection_cam_fps) if collection_cam_enabled else 1
-    
     while True:
         t_start = time.perf_counter()
         # Capture frame
@@ -1300,25 +1197,6 @@ try:
             except Exception as e:
                 print(f'Error capturing from Picamera: {e}')
                 break
-        
-        # Process collection camera (if enabled, at reduced FPS)
-        if collection_cam_enabled and collection_cap is not None:
-            collection_frame_counter += 1
-            if collection_frame_counter >= collection_frame_skip:
-                collection_frame_counter = 0
-                
-                ret_col, collection_frame = collection_cap.read()
-                if ret_col:
-                    # Run detection on collection camera
-                    collection_results = model(collection_frame, verbose=False)
-                    collection_detections = collection_results[0].boxes
-                    
-                    # Check if trash crossed collection line
-                    check_collection_confirmation(collection_detections, collection_frame)
-                    
-                    # Display collection camera feed
-                    cv2.imshow('Collection Camera', collection_frame)
-        
         # Process and annotate frame
         frame, object_count = process_frame(frame)
 
@@ -1329,10 +1207,6 @@ try:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
         cv2.putText(frame, f'Confidence: {int(min_thresh*100)}%', (10,90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-        
-        # Display trash collection count
-        cv2.putText(frame, f'Trash Collected: {total_trash_collected}', (10,270),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
         # Display Pixhawk connection status if applicable
         if DRONEKIT_AVAILABLE:
@@ -1536,8 +1410,6 @@ finally:
     # Cleanup (robust)
     # ---------------------------
     print(f'Average FPS: {avg_frame_rate:.1f}')
-    print(f'Total Trash Collected: {total_trash_collected}')
-    
     try:
         if source_type == 'usb':
             cap.release()
@@ -1545,15 +1417,6 @@ finally:
             cap.stop()
     except Exception:
         pass
-    
-    # Release collection camera
-    if collection_cap is not None:
-        try:
-            collection_cap.release()
-            print("Collection camera released.")
-        except Exception as e:
-            print(f"Error releasing collection camera: {e}")
-    
     if record:
         try:
             recorder.release()

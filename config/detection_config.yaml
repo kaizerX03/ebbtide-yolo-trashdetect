@@ -1,12 +1,19 @@
 # YOLO Detection Configuration
 
 model:
-  path: "/home/pi/ebbtide-yolo-trashdetect/best_ncnn_model"  # You can change this to your custom model path
+  path: "best_ncnn_model"  # Relative path works on both Pi and Windows
   confidence_threshold: 0.4
 
 camera:
   source: "picamera0"  # Options: "usb0", "usb1", "picamera0" 
   resolution: "640x480"  # Format: WIDTHxHEIGHT
+
+collection_camera:
+  enabled: false  # Set to true to enable collection confirmation camera
+  source: "usb0"  # Options: "usb0", "usb1" (use USB for 2nd camera)
+  resolution: "320x240"  # Lower resolution for better performance
+  collection_line_percent: 0.7  # Vertical position of collection line (0.0=top, 1.0=bottom)
+  fps: 10  # Lower FPS to reduce CPU load
 
 recording:
   enabled: false  # Set to true to record video output
