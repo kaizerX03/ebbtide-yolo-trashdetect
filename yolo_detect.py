@@ -104,6 +104,8 @@ idle_brake_s = float(nav_cfg.get('idle_brake_s', 0.5))
 # Test mode flags
 test_mode_cfg = config.get('test_mode', {})
 simulate_navigation = bool(test_mode_cfg.get('simulate_navigation', False))
+test_nav_mode = bool(test_mode_cfg.get('test_nav_mode', False))
+detection_buffer_time = float(test_mode_cfg.get('detection_buffer_time', 3.0))
 
 @dataclass
 class ApproachState:
@@ -132,6 +134,10 @@ suppression_start_time = 0.0
 total_trash_collected = 0
 last_collection_time = 0.0
 collection_cooldown = 3.0  # Prevent double-counting same trash
+
+# Detection buffer (for TEST_NAV mode)
+detection_buffer_start_time = 0.0
+detection_buffering = False
 
 def log_nav_event(event_type, **fields):
     if not nav_logging_enabled:
@@ -748,8 +754,102 @@ def handle_detections(detections, frame):
     
     current_mode = vehicle.mode.name
     
-    # If we have detections and we're not already in MANUAL mode, switch to MANUAL
-    if has_detections and current_mode == 'AUTO' and not in_detection_mode:
+    # TEST_NAV MODE: Boat stays in HOLD until trash detected, then approaches
+    if test_nav_mode:
+        global detection_buffer_start_time, detection_buffering
+        
+        # If we have detections and we're in HOLD, start buffer countdown
+        if has_detections and current_mode == 'HOLD' and not in_detection_mode and not detection_buffering:
+            detection_buffering = True
+            detection_buffer_start_time = current_time
+            print(f"\n[TEST_NAV] Trash detected! Starting {detection_buffer_time}s buffer countdown...")
+            print(f"[TEST_NAV] Place trash in front of boat now!")
+        
+        # Show buffer countdown on screen
+        if detection_buffering:
+            buffer_elapsed = current_time - detection_buffer_start_time
+            buffer_remaining = detection_buffer_time - buffer_elapsed
+            
+            if buffer_remaining > 0:
+                # Display countdown
+                countdown_text = f"DETECTION BUFFER: {buffer_remaining:.1f}s"
+                textsize = cv2.getTextSize(countdown_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
+                cv2.putText(frame, countdown_text,
+                           (frame.shape[1]//2 - textsize[0]//2, frame.shape[0]//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+                cv2.putText(frame, "Place trash in front of boat",
+                           (frame.shape[1]//2 - 200, frame.shape[0]//2 + 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Keep motors neutral during buffer
+                set_neutral_motors()
+            else:
+                # Buffer complete - switch to MANUAL and start approach
+                detection_buffering = False
+                original_mode = 'HOLD'
+                print(f"\n[TEST_NAV] Buffer complete! Switching from HOLD to MANUAL for approach")
+                
+                try:
+                    vehicle.mode = VehicleMode('MANUAL')
+                    in_detection_mode = True
+                    mode_switch_time = current_time
+                    set_neutral_motors()
+                    
+                    # Show mode switch notification
+                    text = "TEST_NAV: HOLD → MANUAL (APPROACHING)"
+                    textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    cv2.putText(frame, text, 
+                              (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 30),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                except Exception as e:
+                    print(f"Error switching mode: {e}")
+                
+                # Activate approach state
+                if not approach_state.active:
+                    approach_state.active = True
+                    approach_state.start_time = current_time
+                    approach_state.last_seen_time = current_time
+                    approach_state.phase = 'align'
+                    approach_state.center_error = center_error
+                    if most_centered:
+                        approach_state.center_x = most_centered[0]
+                        approach_state.center_y = most_centered[1]
+                        approach_state.bbox_height_px = (most_centered[5] - most_centered[4]) if len(most_centered) >= 6 else None
+                    print("[TEST_NAV] Approach state activated")
+                    log_nav_event('test_nav_approach_start', mode=current_mode)
+        
+        # If detection lost during buffer, cancel buffer
+        if detection_buffering and not has_detections:
+            print("[TEST_NAV] Detection lost during buffer - cancelling")
+            detection_buffering = False
+        
+        # After no detections for duration, return to HOLD instead of AUTO
+        if in_detection_mode:
+            time_since_last_detection = current_time - last_detection_confirmed_time
+            if time_since_last_detection >= mode_switch_duration and original_mode == 'HOLD':
+                print(f"\n[TEST_NAV] No detections for {mode_switch_duration}s. Returning to HOLD")
+                try:
+                    vehicle.mode = VehicleMode('HOLD')
+                    vehicle.channels.overrides = {}
+                    in_detection_mode = False
+                    original_mode = None
+                    detection_buffering = False  # Reset buffer state
+                    print("[TEST_NAV] Returned to HOLD - boat stationary")
+                except Exception as e:
+                    print(f"Error returning to HOLD: {e}")
+        
+        # Skip the normal AUTO mode logic below when in TEST_NAV mode
+        if current_mode != 'AUTO':
+            # Continue to navigation logic at end of function
+            pass
+        else:
+            # If somehow in AUTO during TEST_NAV, warn user
+            cv2.putText(frame, "WARNING: TEST_NAV requires HOLD mode, not AUTO", 
+                       (10, frame.shape[0] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    
+    # NORMAL MODE: If we have detections and we're not already in MANUAL mode, switch to MANUAL
+    elif has_detections and current_mode == 'AUTO' and not in_detection_mode:
         # Store the original mode so we can switch back later
         original_mode = current_mode
         
@@ -882,13 +982,19 @@ def handle_detections(detections, frame):
             # Still waiting for a detection with center data
             return
 
-        # Phase transitions
+        # Phase transitions with overshoot protection
         if approach_state.phase == 'align':
             # If mostly centered, move to advance
             if abs(approach_state.center_error) < 0.05:
                 approach_state.phase = 'advance'
                 print("[NAV] Alignment achieved -> advancing.")
                 log_nav_event('phase_change', new_phase='advance')
+        elif approach_state.phase == 'advance':
+            # If we become significantly misaligned during advance, go back to align
+            if abs(approach_state.center_error) > 0.15:  # More lenient threshold
+                approach_state.phase = 'align'
+                print(f"[NAV] Misalignment detected (err={approach_state.center_error:.2f}) -> returning to align phase.")
+                log_nav_event('phase_change', new_phase='align', reason='overshoot')
         
         # Determine differential thrust
         err = max(-1.0, min(1.0, approach_state.center_error))
@@ -1221,7 +1327,20 @@ print("  'h': Show Pixhawk command help")
 print("  'e': Toggle auto navigation thrust (diversion ON/OFF)")
 print("  'r': Test right motor (channel 1)")
 print("  'l': Test left motor (channel 3)")
-# Mode switching is now automatic
+
+if test_nav_mode:
+    print("\n=== TEST_NAV MODE ACTIVE ===")
+    print("Instructions for testing trash navigation:")
+    print("  1. Arm the boat ('a' key)")
+    print("  2. Set mode to HOLD ('m' key, then select HOLD)")
+    print("  3. Enable motor control ('e' key)")
+    print("  4. Boat will stay stationary until trash detected")
+    print(f"  5. When trash detected: {detection_buffer_time}s buffer to place trash")
+    print("  6. After buffer: Auto approaches and collects")
+    print("  7. After collection: Returns to HOLD (stationary)")
+    print("================================\n")
+else:
+    print("\nNormal AUTO mode - Mode switching is automatic")
 
 avg_frame_rate = 0
 frame_rate_buffer = []
@@ -1352,8 +1471,13 @@ try:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, motor_color, 2)
 
         # Display mode switching status (always enabled)
-        cv2.putText(frame, f'Auto Mode Switch: ENABLED', (10,180),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        if test_nav_mode:
+            nav_status = 'Buffering' if detection_buffering else 'Active'
+            cv2.putText(frame, f'TEST_NAV MODE: {nav_status}', (10,180),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,165,255), 2)
+        else:
+            cv2.putText(frame, f'Auto Mode Switch: ENABLED', (10,180),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
         # Display armed status
         if vehicle is not None:

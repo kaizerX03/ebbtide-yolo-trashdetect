@@ -54,3 +54,8 @@ test_mode:
   simulate_navigation: false  # Simulate navigation commands without sending to Pixhawk
   overlay_predictions: true   # Show prediction overlays on screen (direction, distance predictions)
   test_output_dir: "test_results"  # Directory to save test results
+  
+  # TEST_NAV Mode: For testing trash navigation without autopilot mission
+  # Boat stays in HOLD (stationary) until trash detected, then approaches
+  test_nav_mode: false         # Set to true for standalone trash navigation testing
+  detection_buffer_time: 3.0   # Seconds to wait after detection before starting approach (gives time to place trash)
