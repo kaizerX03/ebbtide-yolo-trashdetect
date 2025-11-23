@@ -17,13 +17,15 @@ __pycache__/
 .env
 venv/
 
-# Model files
+# Model files (but keep best_ncnn_model for the project)
 ebb_ncnn_model/
 *.pt
 *.onnx
 *.weights
-*.bin
 runs/
+# Allow NCNN model binaries
+!best_ncnn_model/*.bin
+!best_ncnn_model/*.param
 
 # Library and dependency directories
 lib/
@@ -47,12 +49,3 @@ Thumbs.db
 *.log
 
 /lib64
-
-# Update .gitignore to be more comprehensive
-best_ncnn_model/
-ncnn
-pyvenv.cfg
-*.pt
-*.bin
-*.param
-

@@ -1,0 +1,16 @@
+description: Ultralytics YOLO11n model trained on C:\final_trashdetection-ebbtide-080424\finetunewithweights.yaml
+author: Ultralytics
+date: '2025-04-16T04:45:30.794659'
+version: 8.3.40
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: Human
+  1: NonTrash
+  2: Trash
