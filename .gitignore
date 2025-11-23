@@ -47,3 +47,12 @@ Thumbs.db
 *.log
 
 /lib64
+
+# Update .gitignore to be more comprehensive
+best_ncnn_model/
+ncnn
+pyvenv.cfg
+*.pt
+*.bin
+*.param
+
