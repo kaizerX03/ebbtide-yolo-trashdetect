@@ -1,16 +1,18 @@
 #!/bin/bash
 
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Activate virtual environment
-source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
-source /home/pi/ebbtide-yolo-trashdetect/ebb_env/bin/activate
+source "$SCRIPT_DIR/ebb_env/bin/activate"
 
 # Change to project directory
-cd /home/pi/ebbtide-yolo-trashdetect
+cd "$SCRIPT_DIR"
 
 # Check if model exists
-if [ ! -f "/home/pi/ebbtide-yolo-trashdetect/ebb_env/ebb_ncnn_model" ]; then
-    echo "❌ YOLO model not found at /home/pi/ebbtide-yolo-trashdetect/ebb_env/ebb_ncnn_model"
-    echo "Please place your trained model file in the correct location"
+if [ ! -d "$SCRIPT_DIR/best_ncnn_model" ]; then
+    echo "❌ YOLO model not found at $SCRIPT_DIR/best_ncnn_model"
+    echo "Please place your trained model directory in the correct location"
     exit 1
 fi
 

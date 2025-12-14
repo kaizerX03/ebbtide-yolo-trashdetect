@@ -879,8 +879,8 @@ def handle_detections(detections, frame):
             approach_state.active = True
             approach_state.start_time = current_time
             approach_state.last_seen_time = current_time
-            approach_state.phase = 'align'
-            print("[NAV] ApproachState activated (phase=align). Awaiting center calculation integration.")
+            approach_state.phase = 'advance'  # Start directly in advance mode for simple steering
+            print("[NAV] ApproachState activated (phase=advance). Steering towards target.")
             # Initialize error values if available
             approach_state.center_error = center_error
             if most_centered:
@@ -997,28 +997,45 @@ def handle_detections(detections, frame):
                 log_nav_event('phase_change', new_phase='align', reason='overshoot')
         
         # Determine differential thrust
-        err = max(-1.0, min(1.0, approach_state.center_error))
+        # Simple Proportional Control for Differential Thrust
+        # center_error is [-1.0 (Left) ... 0.0 (Center) ... +1.0 (Right)]
+        
+        # Dead zone: if within +/- 0.15 (15%) of center, go straight
+        steering_input = approach_state.center_error
+        if abs(steering_input) < 0.15:
+            steering_input = 0.0
+            
+        # Calculate motor PWMs
+        # To turn RIGHT (error > 0), we want LEFT motor > RIGHT motor
+        # To turn LEFT (error < 0), we want RIGHT motor > LEFT motor
+        
         base = forward_thrust_pwm
-        # Differential: turn_gain applied; invert sign if needed for platform orientation
-        right_pwm = int(base - turn_gain_pwm * err)
-        left_pwm  = int(base + turn_gain_pwm * err)
-        # Clip to safe bounds
+        diff = int(steering_input * turn_gain_pwm)
+        
+        # Channel 3 (Left) and Channel 1 (Right)
+        # If steering_input is positive (Right turn), diff is positive.
+        # Left Motor = Base + Diff (Speed up)
+        # Right Motor = Base - Diff (Slow down)
+        
+        left_pwm = int(base + diff)
+        right_pwm = int(base - diff)
+        
+        # Clip to safe bounds (1100-1900)
         def clip_pwm(val):
-            return max(1200, min(1900, val))
+            return max(1100, min(1900, val))
+            
+        left_pwm = clip_pwm(left_pwm)
         right_pwm = clip_pwm(right_pwm)
-        left_pwm  = clip_pwm(left_pwm)
 
         # ALIGN phase handling: optionally hold completely neutral until centered
         if approach_state.phase == 'align':
-            if align_hold:
-                right_pwm = 1335
-                left_pwm = 1500
-            else:
-                # legacy slow creep behavior
-                right_pwm = int((right_pwm + 1335) / 2)
-                left_pwm  = int((left_pwm + 1500) / 2)
+            # In ALIGN phase, we might want to turn in place or move very slowly
+            # For simplicity, let's just use the differential logic but maybe slower base speed?
+            # For now, using the same logic as 'advance' to keep it simple as requested.
+            pass
 
         # Idle brake: if detections temporarily lost, stop forward thrust but keep phase
+
         no_detect_elapsed = current_time - last_detection_confirmed_time
         if no_detect_elapsed > idle_brake_s and approach_state.phase in ('align','advance'):
             # Only remove forward thrust, keep slight differential for heading correction if desired
@@ -1101,123 +1118,16 @@ def handle_detections(detections, frame):
     current_time = time.time()
     
     # STAGE 1: MOTORS ACTIVE - Motors are currently paused
-    if motor_active:
-        # Check if the full pause time has elapsed
-        elapsed_time = current_time - motor_start_time
-        if elapsed_time >= motor_run_time:
-            # Motor pause time complete - mark pause as complete but keep motors neutral
-            print("\nPause time complete (5s). Staying in MANUAL mode until countdown completes.")
-            
-            # Record stop time and state but keep motors at neutral until mode switch completes
-            motor_active = False
-            last_detection_time = current_time  # Start cooldown period
-            
-            # Continue enforcing neutral position while in detection mode
-            if in_detection_mode:
-                set_neutral_motors()
-                
-                # Show status message (moved to bottom)
-                text = "PAUSE COMPLETE - AWAITING MODE SWITCH"
-                textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-                cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                
-                print("Continuing to hold position until 10s detection countdown completes")
-            else:
-                # If not in detection mode (unusual case), resume motion (moved to bottom)
-                text = "MOTION RESUMED"
-                textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-                cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                print("Resumed motion after pause")
-        else:
-            # Motors still paused - show countdown
-            remaining_time = motor_run_time - elapsed_time
-            
-            # SIMPLIFIED APPROACH: Keep motors at neutral
-            # No checks, no diagnostics that might interfere
-            # Simply enforce neutral position throughout the entire 5-second duration
-            set_neutral_motors()
-            
-            # Only log status once per second without any checks or modifications
-            if int(elapsed_time) % 1 == 0:  # Log once per second
-                print(f"Motors paused: {elapsed_time:.1f}s of {motor_run_time}s")
-            
-            # Display motor status (centered)
-            text = "MOTORS PAUSED"
-            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 150),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Show motor values on screen (centered)
-            motor_text = f"R:1335 L:1500"
-            textsize = cv2.getTextSize(motor_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            cv2.putText(frame, motor_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Show remaining time for motors to run (centered)
-            time_text = f"Paused: {remaining_time:.1f}s remaining"
-            textsize = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            cv2.putText(frame, time_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-        return  # Skip all other detection while motors are active
+    # REMOVED: Conflicting "pause motors" logic to allow active navigation
     
     # STAGE 2: COOLDOWN - Wait cooldown period after motors stop
-    if current_time - last_detection_time <= detection_cooldown:
-        # In cooldown period
-        cooldown_time = detection_cooldown - (current_time - last_detection_time)
-        cooldown_text = f"Cooldown: {cooldown_time:.1f}s"
-        textsize = cv2.getTextSize(cooldown_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-        cv2.putText(frame, cooldown_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        return  # Skip detection during cooldown
+    # REMOVED: Cooldown logic to allow continuous tracking
     
     # STAGE 3: DETECTION - Check for objects to activate motors
-    # Check if we have any high-confidence detections
-    has_detections = False
-    for detection in detections:
-        conf = detection.conf.item()
-        if conf > min_thresh:  # Use confidence threshold from config
-            has_detections = True
-            break
+    # REMOVED: Old "stop on detection" logic. 
+    # Navigation is now handled by the 'approach_state' block above.
     
-    # If we have detections, stop motors instead of activating them
-    if has_detections:
-        print("\nObject detected!")
-        
-        # If motor control is enabled, stop motors for the pause duration
-        if motor_control_enabled:
-            print("\nSTOPPING MOTORS FOR 5 SECONDS")
-            
-            # SIMPLIFIED APPROACH: Just set motors to neutral directly
-            # No checks, no diagnostics that might interfere
-            set_neutral_motors()
-            
-            # Record start time and activate flag immediately
-            motor_start_time = current_time
-            motor_active = True
-            
-            print(f"Motors stopped for {motor_run_time} seconds")
-            print(f"Current mode: {vehicle.mode.name}")
-            
-            # Display activation message (centered)
-            text = "MOTORS STOPPED!"
-            textsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            cv2.putText(frame, text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 150),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Show motor values (centered)
-            motor_text = f"R:1335 L:1500"
-            textsize = cv2.getTextSize(motor_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            cv2.putText(frame, motor_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 120),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Show full run time at start (centered)
-            time_text = f"Paused: {motor_run_time:.1f}s remaining"
-            textsize = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            cv2.putText(frame, time_text, (frame.shape[1]//2 - textsize[0]//2, frame.shape[0] - 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    return
 
 def process_frame(frame):
     """Run detection and annotate frame."""
