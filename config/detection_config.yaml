@@ -23,15 +23,17 @@ distance_estimation:
   known_object_height_mm: 120  # Set to the real-world height of your object in mm
 
 pixhawk:
-  connection: "/dev/ttyAMA0"  # Serial connection to Pixhawk (may be ttyACM0, ttyS0, etc.)
+  connection: "/dev/ttyAMA0"   # Serial connection to Pixhawk (found on ttyAMA0)
   baud_rate: 57600           # Default baud rate for Pixhawk
+  timeout: 60                # Connection timeout in seconds
   control_enabled: true      # Set to true to enable navigation control
   trash_collection_mode: "direct_control"  # Options: "direct_control" or "waypoint_override"
 
 navigation:
   mode: "direct_control"            # direct_control | waypoint_override
   forward_thrust_pwm: 1600           # Base forward thrust PWM (slightly above neutral)
-  turn_gain_pwm: 200                 # Differential added/subtracted for turning
+  turn_gain_pwm: 400                 # Differential added/subtracted for turning
+  center_dead_zone: 0.20             # Range (+/-) where boat goes straight (0.20 = 20% of screen)
   collection_distance_m: 1.0         # Stop when estimated distance below this
   lost_target_timeout_s: 3           # Abort if target lost for this duration
   max_approach_time_s: 30            # Hard cap on diversion time
